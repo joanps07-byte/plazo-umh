@@ -14,7 +14,7 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DB"
 database_name = "plazo-umh"
-database_id = "PEGA-AQUI-EL-ID-DE-TU-BASE-DE-DATOS"
+database_id = "1abdfb24-5bb2-4300-86af-18799b5b0da3"
 
 # IA gratuita de Cloudflare para leer los avisos (si falla, se usan reglas).
 [ai]
