@@ -1,0 +1,36 @@
+# Plazo — configuración de Cloudflare Workers (plan gratuito).
+# El nombre debe coincidir con el del Worker en el panel de Cloudflare.
+name = "plazo-umh"
+main = "worker/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# La app (carpeta app/) se sirve como archivos estáticos; /api y /cal los atiende el Worker.
+[assets]
+directory = "./app"
+binding = "ASSETS"
+
+# Base de datos. Crea una D1 llamada "plazo-umh" en el panel y pega aquí su identificador.
+[[d1_databases]]
+binding = "DB"
+database_name = "plazo-umh"
+database_id = "PEGA-AQUI-EL-ID-DE-TU-BASE-DE-DATOS"
+
+# IA gratuita de Cloudflare para leer los avisos (si falla, se usan reglas).
+[ai]
+binding = "AI"
+
+# El vigilante se ejecuta cada minuto y revisa a un usuario por ejecución.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+MOODLE_URL = "https://campus.umh.es"
+POLL_MINUTES = "10"   # minutos mínimos entre dos revisiones del mismo usuario
+MAX_USERS = "150"     # tope de usuarios de este servidor
+
+[observability]
+enabled = true
+
+# Secreto obligatorio (NO lo escribas aquí): MASTER_KEY, 24 caracteres o más.
+# Panel de Cloudflare → tu Worker → Settings → Variables and Secrets → Add → tipo "Secret".

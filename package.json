@@ -1,0 +1,14 @@
+{
+  "name": "plazo-umh",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tareas, plazos y avisos del Campus Virtual UMH. App no oficial.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "test": "node --experimental-sqlite --no-warnings tests/worker.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
