@@ -6,7 +6,7 @@
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const TZ = 'Europe/Madrid';
 
 /* ───────────────────────── utilidades ───────────────────────── */
@@ -65,17 +65,42 @@ const madridYMD = (ts) => {
   return p; // YYYY-MM-DD
 };
 
+
 /* ───────────────────────── cifrado y sesiones ───────────────────────── */
 
-async function masterKeys(env) {
-  if (!env.MASTER_KEY || String(env.MASTER_KEY).length < 24) throw new SetupError('Falta el secreto MASTER_KEY (mínimo 24 caracteres).');
-  const raw = await crypto.subtle.digest('SHA-256', enc.encode('plazo:' + env.MASTER_KEY));
-  return {
-    aes: await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']),
-    hmac: await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
-  };
-}
 class SetupError extends Error {}
+const randomId = (n = 18) => b64u.enc(crypto.getRandomValues(new Uint8Array(n)));
+const autoKeys = new WeakMap(); // env.DB → clave automática ya leída
+const derived = new Map();      // secreto → claves importadas
+
+/** Secreto de cifrado: MASTER_KEY si está definido; si no, una clave aleatoria guardada en la base de datos. */
+async function masterSecret(env) {
+  if (env.MASTER_KEY && String(env.MASTER_KEY).length >= 16) return { secret: String(env.MASTER_KEY), source: 'secreto' };
+  if (!env.DB) throw new SetupError('Falta la base de datos D1 (binding DB).');
+  let secret = autoKeys.get(env.DB);
+  if (!secret) {
+    secret = await getConfig(env, 'auto_key');
+    if (!secret) {
+      await env.DB.prepare('INSERT OR IGNORE INTO config (k, v) VALUES (?, ?)').bind('auto_key', randomId(32)).run();
+      secret = await getConfig(env, 'auto_key');
+    }
+    autoKeys.set(env.DB, secret);
+  }
+  return { secret, source: 'auto' };
+}
+async function masterKeys(env) {
+  const { secret } = await masterSecret(env);
+  if (!derived.has(secret)) {
+    derived.set(secret, (async () => {
+      const raw = await crypto.subtle.digest('SHA-256', enc.encode('plazo:' + secret));
+      return {
+        aes: await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']),
+        hmac: await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
+      };
+    })());
+  }
+  return derived.get(secret);
+}
 
 async function seal(env, text) {
   const { aes } = await masterKeys(env);
@@ -98,10 +123,10 @@ function safeEqual(a, b) {
   for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return r === 0;
 }
-const randomId = (n = 18) => b64u.enc(crypto.getRandomValues(new Uint8Array(n)));
 
 /* ───────────────────────── base de datos (D1) ───────────────────────── */
 
+const SCHEMA = '2';
 const schemaReady = new WeakSet();
 async function ensureSchema(env) {
   if (schemaReady.has(env.DB)) return;
@@ -110,10 +135,19 @@ async function ensureSchema(env) {
       id INTEGER PRIMARY KEY, name TEXT, token_enc TEXT NOT NULL, salt TEXT NOT NULL, feed_secret TEXT NOT NULL,
       subs TEXT NOT NULL DEFAULT '[]', prefs TEXT NOT NULL DEFAULT '{}', snapshot TEXT,
       events TEXT NOT NULL DEFAULT '[]', changes TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'ok',
-      created_at INTEGER NOT NULL, last_poll INTEGER NOT NULL DEFAULT 0, last_ok INTEGER NOT NULL DEFAULT 0, fails INTEGER NOT NULL DEFAULT 0)`),
+      created_at INTEGER NOT NULL, last_poll INTEGER NOT NULL DEFAULT 0, last_ok INTEGER NOT NULL DEFAULT 0, fails INTEGER NOT NULL DEFAULT 0,
+      agenda TEXT NOT NULL DEFAULT '[]', sent TEXT NOT NULL DEFAULT '{}', ustate TEXT NOT NULL DEFAULT '{}')`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS config (k TEXT PRIMARY KEY, v TEXT NOT NULL)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS ai_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL, at INTEGER NOT NULL)`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS users_poll ON users (status, last_poll)`),
   ]);
+  // Actualización desde la versión 1: columnas nuevas (si ya existen, el error se ignora).
+  if ((await getConfig(env, 'schema')) !== SCHEMA) {
+    for (const col of ["agenda TEXT NOT NULL DEFAULT '[]'", "sent TEXT NOT NULL DEFAULT '{}'", "ustate TEXT NOT NULL DEFAULT '{}'"]) {
+      try { await env.DB.prepare(`ALTER TABLE users ADD COLUMN ${col}`).run(); } catch { /* la columna ya existe */ }
+    }
+    await setConfig(env, 'schema', SCHEMA);
+  }
   schemaReady.add(env.DB);
 }
 const getConfig = async (env, k) => (await env.DB.prepare('SELECT v FROM config WHERE k = ?').bind(k).first())?.v ?? null;
@@ -180,6 +214,7 @@ export async function encryptPush(sub, payload, test) {
 async function vapid(env) {
   let pub = await getConfig(env, 'vapid_pub');
   let privSealed = await getConfig(env, 'vapid_priv');
+  if (pub && privSealed) { try { await unseal(env, privSealed); } catch { pub = null; } } // cambió la clave de cifrado: se generan claves nuevas
   if (!pub || !privSealed) {
     const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     pub = b64u.enc(await crypto.subtle.exportKey('raw', pair.publicKey));
@@ -229,10 +264,66 @@ async function pushAll(env, subs, note) {
   return alive;
 }
 
-/* ───────────────────────── lectura de avisos: reglas + IA ───────────────────────── */
 
-const EVAL_WORDS = /\b(ex[aá]men(es)?|parcial(es)?|evaluaci[oó]n|prueba|test|control|convocatoria|defensa|recuperaci[oó]n|exposici[oó]n|presentaci[oó]n oral)\b/i;
+/* ───────────────────────── clasificación y lectura de avisos: reglas + IA ───────────────────────── */
+
+export const TYPES = ['entrega', 'examen', 'actividad'];
+const TYPE_LABEL = { entrega: 'Entrega', examen: 'Examen', actividad: 'Actividad' };
 const MONTHS = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };
+
+// Estas reglas están repetidas en app/app.js (la app las usa cuando no hay servidor).
+const RX_INFO = /^\s*(calificaci|notas?\b|resultados?\b|soluci[oó]n|soluciones|revisi[oó]n\b|listado|lista de|actas?\b|gu[ií]a\b|material|plantilla|enunciado|documentaci[oó]n|anexo|r[uú]brica)|\b(calificaciones|notas (del?|de la|finales|provisionales|definitivas))\b/i;
+const RX_EXAM = /\b(ex[aá]men(es)?|parcial(es)?|prueba (escrita|objetiva|final|de evaluaci[oó]n|presencial|te[oó]rica|pr[aá]ctica)|control|test (de evaluaci[oó]n|final)|convocatoria (ordinaria|extraordinaria)|recuperaci[oó]n)\b/i;
+const RX_TASK = /\b(entrega|entregable|entregar|tarea|ejercicios?|pr[aá]ctica|laboratorio|trabajo|memoria|informe|actividad|proyecto|cuestionario|subir|subida)\b/i;
+const RX_ACT = /\b(seminario|charla|conferencia|taller|visita|jornadas?|ponencia|mesa redonda|tutor[ií]a|reuni[oó]n|sesi[oó]n|exposici[oó]n|presentaci[oó]n|defensa|revisi[oó]n)\b/i;
+
+/** Tipo de una tarea del campus por su nombre. `sure` indica si la regla basta o conviene preguntar a la IA. */
+export function ruleType(name) {
+  const s = String(name || '');
+  if (RX_INFO.test(s)) return { type: 'info', sure: !RX_TASK.test(s) };
+  if (RX_EXAM.test(s)) return { type: 'examen', sure: false };
+  if (RX_TASK.test(s)) return { type: 'entrega', sure: true };
+  return { type: 'entrega', sure: false };
+}
+
+let aiOkWritten = 0;
+async function aiJson(env, system, user, schema, maxTokens) {
+  try {
+    const out = await env.AI.run(env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      response_format: { type: 'json_schema', json_schema: schema }, max_tokens: maxTokens, temperature: 0,
+    });
+    let r = out?.response ?? out;
+    if (typeof r === 'string') r = JSON.parse(r.slice(r.indexOf('{'), r.lastIndexOf('}') + 1));
+    if (!r || typeof r !== 'object') throw new Error('respuesta vacía');
+    if (env.DB && nowSec() - aiOkWritten > 3600) { aiOkWritten = nowSec(); await setConfig(env, 'ai_ok', String(aiOkWritten)).catch(() => {}); }
+    return r;
+  } catch (e) {
+    if (env.DB) await setConfig(env, 'ai_err', JSON.stringify({ at: nowSec(), msg: clip(e.message, 160) })).catch(() => {});
+    throw e;
+  }
+}
+
+const CLASS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, tipo: { type: 'string', enum: ['entrega', 'examen', 'actividad', 'informativo'] } }, required: ['id', 'tipo'] } } }, required: ['items'] };
+const CLASS_PROMPT = `Clasificas elementos creados con la herramienta «Tarea» del campus virtual de una universidad española. Los profesores la usan para cosas distintas. Para cada elemento elige un tipo:
+- "entrega": el estudiante debe hacer y subir o entregar algo antes de una fecha (práctica, ejercicios, trabajo, memoria, informe).
+- "examen": es un examen, parcial, prueba, control o test de evaluación (presencial u online) que el profesor ha creado como tarea para que aparezca en el calendario, o para subir el examen resuelto.
+- "actividad": un acto al que hay que asistir sin entregar nada (seminario, charla, visita, exposición, tutoría).
+- "informativo": el estudiante NO tiene que hacer nada: calificaciones, notas, resultados, soluciones, revisiones, listados, material o documentación que publica el profesor.
+Responde solo con JSON: {"items":[{"id":número,"tipo":"..."}]} con todos los elementos recibidos.`;
+
+/** Clasifica con IA una lista de tareas [{id, name, intro, course}]. Devuelve {id: tipo}. Lanza error si la IA falla. */
+export async function classifyAssignments(env, list) {
+  const user = list.map((a) => `id ${a.id} | asignatura: ${clip(a.course, 60)} | nombre: ${clip(a.name, 140)}${a.intro ? ` | descripción: ${clip(a.intro, 240)}` : ''}`).join('\n');
+  const r = await aiJson(env, CLASS_PROMPT, user, CLASS_SCHEMA, 60 + list.length * 24);
+  const out = {};
+  const ids = new Set(list.map((a) => a.id));
+  for (const it of Array.isArray(r.items) ? r.items : []) {
+    const id = +it.id, tipo = it.tipo === 'informativo' ? 'info' : it.tipo;
+    if (ids.has(id) && (TYPES.includes(tipo) || tipo === 'info')) out[id] = tipo;
+  }
+  return out;
+}
 
 /** Extrae fecha y hora por reglas. Devuelve null si no hay una fecha futura razonable. */
 export function parseDateEs(text, postedTs) {
@@ -262,72 +353,130 @@ export function parseDateEs(text, postedTs) {
   return { date: `${ok.y}-${String(ok.m).padStart(2, '0')}-${String(ok.d).padStart(2, '0')}`, time: hh === null ? null : `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}` };
 }
 
-const AI_SCHEMA = {
+const DATEISH = /\b\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|sep?tiembre|octubre|noviembre|diciembre)|\b\d{1,2}[\/\-.]\d{1,2}\b|\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|mañana|pr[oó]xim[oa])\b/i;
+const NOTICE_WORDS = /\b(ex[aá]men(es)?|parcial(es)?|prueba|control|test|evaluaci[oó]n|entrega[rs]?|plazo|fecha l[ií]mite|seminario|charla|conferencia|taller|visita|jornadas?|sesi[oó]n|pr[aá]cticas?|clase|tutor[ií]as?|exposici[oó]n|presentaci[oó]n|defensa|recuperaci[oó]n|reuni[oó]n|convocatoria|revisi[oó]n)\b/i;
+const NOTICE_SCHEMA = {
   type: 'object',
-  properties: {
-    es_evaluacion: { type: 'boolean' },
-    titulo: { type: 'string' },
-    fecha: { type: ['string', 'null'], description: 'YYYY-MM-DD' },
-    hora_inicio: { type: ['string', 'null'], description: 'HH:MM en 24 h' },
-    hora_fin: { type: ['string', 'null'] },
-    lugar: { type: ['string', 'null'] },
-  },
-  required: ['es_evaluacion', 'titulo', 'fecha', 'hora_inicio', 'hora_fin', 'lugar'],
+  properties: { items: { type: 'array', items: { type: 'object', properties: {
+    tipo: { type: 'string', enum: ['examen', 'entrega', 'actividad'] }, titulo: { type: 'string' },
+    fecha: { type: 'string', description: 'YYYY-MM-DD' }, hora_inicio: { type: 'string', description: 'HH:MM en 24 h, o cadena vacía' },
+    hora_fin: { type: 'string', description: 'HH:MM en 24 h, o cadena vacía' }, lugar: { type: 'string', description: 'lugar, o cadena vacía' },
+  }, required: ['tipo', 'titulo', 'fecha', 'hora_inicio', 'hora_fin', 'lugar'] } } },
+  required: ['items'],
 };
+const NOTICE_PROMPT = `Lees avisos que los profesores publican en el campus virtual de una universidad española. Extrae SOLO lo que el estudiante tiene que hacer o a lo que tiene que asistir y que tenga una fecha concreta. Tipos:
+- "examen": examen, parcial, prueba, control, test, defensa o recuperación al que hay que presentarse.
+- "entrega": algo que el estudiante debe entregar o subir; la fecha es la fecha límite.
+- "actividad": seminario, charla, taller, visita, exposición, tutoría grupal, revisión de examen, clase extraordinaria o cambio de fecha de una sesión.
+No incluyas: publicación de notas, calificaciones o material; hechos ya pasados; nada que no tenga fecha. No inventes fechas ni horas: si el aviso no da la hora o el lugar, deja ese campo como cadena vacía. Resuelve expresiones como «mañana» o «el próximo jueves» a partir de la fecha de publicación. Títulos cortos y concretos (máximo 8 palabras), sin el nombre de la asignatura. Como máximo 4 elementos. Si no hay nada que extraer, devuelve {"items":[]}. Responde solo con JSON.`;
 
-/** Decide si un aviso anuncia un examen o prueba con fecha. Devuelve un evento o null. */
-export async function detectExam(env, notice) {
+/** Lee un aviso y devuelve los exámenes, entregas y actividades con fecha que anuncia. */
+export async function extractFromNotice(env, notice) {
   const text = clip(`${notice.subject}\n${notice.text}`, 6000);
-  if (!EVAL_WORDS.test(text)) return null;
-  let found = null, source = 'reglas';
+  if (!NOTICE_WORDS.test(text) || !DATEISH.test(text)) return { items: [], source: 'filtro' };
+  let raw = null, source = 'reglas';
   if (env.AI) {
     try {
-      const out = await env.AI.run(env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-        messages: [
-          { role: 'system', content: 'Eres un asistente que lee avisos de profesores universitarios en español. Decide si el aviso convoca o fija la fecha de un examen, parcial, prueba, control, defensa o cualquier acto de evaluación al que el estudiante debe presentarse. Publicar notas o revisar un examen ya hecho NO es una evaluación. Responde solo con JSON. Si hay varias fechas, da la del acto de evaluación más próximo. No inventes fechas: si el aviso no la da, usa null.' },
-          { role: 'user', content: `Fecha de publicación del aviso: ${madridYMD(notice.created)}\nAsignatura: ${notice.course}\n\nAviso:\n${text}` },
-        ],
-        response_format: { type: 'json_schema', json_schema: AI_SCHEMA },
-        max_tokens: 300, temperature: 0,
-      });
-      let r = out?.response ?? out;
-      if (typeof r === 'string') r = JSON.parse(r.slice(r.indexOf('{'), r.lastIndexOf('}') + 1));
-      if (r && typeof r === 'object') {
-        if (!r.es_evaluacion) return null;
-        if (/^\d{4}-\d{2}-\d{2}$/.test(r.fecha || '')) {
-          found = { date: r.fecha, time: /^\d{1,2}:\d{2}$/.test(r.hora_inicio || '') ? r.hora_inicio.padStart(5, '0') : null, end: /^\d{1,2}:\d{2}$/.test(r.hora_fin || '') ? r.hora_fin.padStart(5, '0') : null, title: clip(r.titulo, 90), place: r.lugar ? clip(r.lugar, 80) : null };
-          source = 'ia';
-        }
-      }
+      const weekday = new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday: 'long' }).format(new Date(notice.created * 1000));
+      const r = await aiJson(env, NOTICE_PROMPT, `Fecha de publicación: ${madridYMD(notice.created)} (${weekday})\nAsignatura: ${notice.course}\n\nAviso:\n${text}`, NOTICE_SCHEMA, 500);
+      raw = (Array.isArray(r.items) ? r.items : []).slice(0, 4).map((it) => ({
+        type: it.tipo, title: clip(it.titulo || notice.subject, 90), date: it.fecha,
+        time: /^\d{1,2}:\d{2}$/.test(it.hora_inicio || '') ? it.hora_inicio.padStart(5, '0') : null,
+        end: /^\d{1,2}:\d{2}$/.test(it.hora_fin || '') ? it.hora_fin.padStart(5, '0') : null,
+        place: it.lugar ? clip(it.lugar, 80) : null,
+      }));
+      source = 'ia';
     } catch (e) { console.log('IA no disponible, se usan reglas:', e.message); }
   }
-  if (!found) {
+  if (!raw) {
     const p = parseDateEs(text, notice.created);
-    if (!p) return null;
-    found = { ...p, end: null, title: clip(notice.subject, 90), place: null };
+    const type = RX_EXAM.test(text) ? 'examen' : /\b(entrega[rs]?|entregable|plazo|fecha l[ií]mite|subir)\b/i.test(text) ? 'entrega' : RX_ACT.test(text) ? 'actividad' : null;
+    raw = p && type ? [{ type, title: clip(notice.subject, 90), date: p.date, time: p.time, end: null, place: null }] : [];
   }
-  const [y, m, d] = found.date.split('-').map(Number);
-  const [hh, mm] = (found.time || '00:00').split(':').map(Number);
-  const start = madridToEpoch(y, m, d, hh, mm);
-  if (!(start > notice.created - 86400 && start < notice.created + 300 * 86400)) return null;
-  let end = null;
-  if (found.time && found.end) { const [eh, em] = found.end.split(':').map(Number); end = madridToEpoch(y, m, d, eh, em); if (end <= start) end = null; }
-  return { id: 'd' + notice.id, title: found.title || clip(notice.subject, 90), course: notice.course, courseId: notice.courseId, start, end, allDay: !found.time, place: found.place, source, noticeId: notice.id, url: notice.url, detected: nowSec() };
+  const items = [];
+  for (const it of raw) {
+    if (!TYPES.includes(it.type) || !/^\d{4}-\d{2}-\d{2}$/.test(it.date || '')) continue;
+    const [y, m, d] = it.date.split('-').map(Number);
+    const [hh, mm] = (it.time || '00:00').split(':').map(Number);
+    const start = madridToEpoch(y, m, d, hh, mm);
+    if (!(start > notice.created - 86400 && start < notice.created + 300 * 86400)) continue;
+    let end = null;
+    if (it.time && it.end) { const [eh, em] = it.end.split(':').map(Number); end = madridToEpoch(y, m, d, eh, em); if (end <= start) end = null; }
+    items.push({ type: it.type, title: it.title, start, end, allDay: !it.time, place: it.place });
+  }
+  return { items, source };
 }
 
-/* ───────────────────────── revisión de un usuario ───────────────────────── */
+async function cacheGet(env, keys) {
+  const out = {};
+  if (!keys.length) return out;
+  const r = await env.DB.prepare(`SELECT k, v FROM ai_cache WHERE k IN (${keys.map(() => '?').join(',')})`).bind(...keys).all();
+  for (const row of r.results || []) out[row.k] = row.v;
+  return out;
+}
+const cachePut = (env, k, v) => env.DB.prepare('INSERT INTO ai_cache (k, v, at) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, at = excluded.at').bind(k, v, nowSec()).run();
 
-const DEFAULT_PREFS = { task_new: true, task_due: true, notice: true, feedback: true, exam: true };
+/* ───────────────────────── preferencias, agenda y estado del usuario ───────────────────────── */
+
+export const OFFSETS = [604800, 259200, 172800, 86400, 43200, 10800, 3600];
+const OFFSET_LABEL = { 604800: 'en 1 semana', 259200: 'en 3 días', 172800: 'en 2 días', 86400: 'en 1 día', 43200: 'en 12 horas', 10800: 'en 3 horas', 3600: 'en 1 hora' };
+const DEFAULT_REM = { examen: [604800, 86400], entrega: [86400, 10800], actividad: [86400, 3600] };
 const parse = (s, fallback) => { try { return JSON.parse(s) ?? fallback; } catch { return fallback; } };
+
+export function cleanPrefs(p) {
+  const out = { notice: p?.notice !== false, feedback: p?.feedback !== false, rem: {} };
+  for (const t of TYPES) {
+    const v = Array.isArray(p?.rem?.[t]) ? p.rem[t] : DEFAULT_REM[t];
+    out.rem[t] = [...new Set(v.map(Number).filter((x) => OFFSETS.includes(x)))].sort((a, b) => b - a);
+  }
+  return out;
+}
+function cleanAgenda(list) {
+  const out = [], seen = new Set();
+  for (const i of Array.isArray(list) ? list.slice(0, 300) : []) {
+    const k = String(i?.k || '').slice(0, 60), ts = Math.floor(+i?.ts || 0);
+    if (!k || seen.has(k) || !TYPES.includes(i.t) || !(ts > 0)) continue;
+    seen.add(k);
+    const o = { k, t: i.t, title: clip(i.title, 120), course: clip(i.course || '', 70), ts };
+    if (i.allDay) o.allDay = 1;
+    if (Number.isInteger(i.a)) o.a = i.a;
+    if (Number.isInteger(i.c)) o.c = i.c;
+    out.push(o);
+  }
+  return out;
+}
+function cleanUstate(u) {
+  const manual = [], marks = {};
+  for (const m of Array.isArray(u?.manual) ? u.manual.slice(0, 120) : []) {
+    if (!m || !TYPES.includes(m.type) || !(+m.ts > 0)) continue;
+    manual.push({ id: String(m.id || '').slice(0, 24), type: m.type, title: clip(m.title, 120), course: Number.isInteger(m.course) ? m.course : 0, ts: Math.floor(+m.ts), allDay: m.allDay ? 1 : 0, place: clip(m.place || '', 80), note: clip(m.note || '', 500) });
+  }
+  let n = 0;
+  for (const [k, v] of Object.entries(u?.marks || {})) {
+    if (n++ >= 600) break;
+    const o = {};
+    if (v?.done) o.done = 1;
+    if (v?.hide) o.hide = 1;
+    if (TYPES.includes(v?.type) || v?.type === 'info') o.type = v.type;
+    if (Object.keys(o).length) marks[String(k).slice(0, 60)] = o;
+  }
+  return { rev: Math.floor(+u?.rev || 0), manual, marks };
+}
+const sameDay = (a, b) => madridYMD(a) === madridYMD(b);
+
+/* ───────────────────────── revisión de un usuario ───────────────────────── */
 
 export async function pollUser(env, user) {
   const now = nowSec();
   const base = (env.MOODLE_URL || 'https://campus.umh.es').replace(/\/+$/, '');
-  const prefs = { ...DEFAULT_PREFS, ...parse(user.prefs, {}) };
+  const prefs = cleanPrefs(parse(user.prefs, {}));
   let subs = parse(user.subs, []);
   const old = parse(user.snapshot, null);
   let events = parse(user.events, []);
   let changes = parse(user.changes, []);
+  let agenda = parse(user.agenda, []);
+  const sent = parse(user.sent, {});
+  const marks = parse(user.ustate, {}).marks || {};
   let token;
   try { token = await unseal(env, user.token_enc); } catch (e) { if (e instanceof SetupError) throw e; token = null; }
 
@@ -350,59 +499,102 @@ export async function pollUser(env, user) {
   }
 
   const fresh = [];
-  const snap = { v: 1, courses: {}, assigns: {}, forums: old?.forums ? { ...old.forums } : {}, seen: old?.seen ? old.seen.slice(-400) : [], notifMax: old?.notifMax || 0 };
+  const snap = { v: 2, courses: {}, assigns: {}, cls: old?.cls ? { ...old.cls } : {}, forums: old?.forums ? { ...old.forums } : {}, seen: old?.seen ? old.seen.slice(-400) : [], notifMax: old?.notifMax || 0 };
+  let aiCalls = 0;
 
-  // 1. Tareas: nuevas y cambios de plazo
+  // 1. Tareas del campus: se clasifican (entrega, examen, actividad o informativa) antes de comparar
+  const all = [];
   for (const c of assignData.courses || []) {
     snap.courses[c.id] = clip(c.fullname, 70);
-    for (const a of c.assignments || []) {
-      snap.assigns[a.id] = [clip(a.name, 120), c.id, a.duedate || 0, a.cmid];
-      if (!old) continue;
-      const before = old.assigns[a.id];
-      const url = `${base}/mod/assign/view.php?id=${a.cmid}`;
-      if (!before) {
-        fresh.push({ k: `task_new:${a.id}`, t: 'task_new', ts: now, title: a.name, course: snap.courses[c.id], courseId: c.id, due: a.duedate || 0, ref: a.id, url });
-      } else if ((before[2] || 0) !== (a.duedate || 0)) {
-        fresh.push({ k: `task_due:${a.id}:${a.duedate || 0}`, t: 'task_due', ts: now, title: a.name, course: snap.courses[c.id], courseId: c.id, from: before[2] || 0, due: a.duedate || 0, ref: a.id, url });
-      }
+    for (const a of c.assignments || []) { all.push({ a, c }); snap.assigns[a.id] = [clip(a.name, 120), c.id, a.duedate || 0, a.cmid]; }
+  }
+  const live = new Set(all.map((x) => String(x.a.id)));
+  for (const id of Object.keys(snap.cls)) if (!live.has(id)) delete snap.cls[id];
+  const doubt = [];
+  for (const { a, c } of all) {
+    if (snap.cls[a.id] || (a.duedate && a.duedate < now - 14 * 86400)) continue;
+    const r = ruleType(a.name);
+    if (r.sure) snap.cls[a.id] = r.type; else doubt.push({ id: a.id, name: a.name, intro: htmlToText(a.intro).slice(0, 300), course: snap.courses[c.id] });
+  }
+  if (doubt.length) {
+    const hits = await cacheGet(env, doubt.slice(0, 40).map((d) => 'a:' + d.id));
+    const ask = [];
+    for (const d of doubt.slice(0, 40)) { if (hits['a:' + d.id]) snap.cls[d.id] = hits['a:' + d.id]; else ask.push(d); }
+    if (ask.length && env.AI) {
+      aiCalls++;
+      try {
+        const res = await classifyAssignments(env, ask.slice(0, 12));
+        for (const [id, type] of Object.entries(res)) { snap.cls[id] = type; await cachePut(env, 'a:' + id, type); }
+      } catch (e) { console.log('clasificación con IA fallida:', e.message); }
+    }
+  }
+  const typeOf = (a) => marks['a:' + a.id]?.type || snap.cls[a.id] || ruleType(a.name).type;
+  const byKey = new Map(agenda.map((i) => [i.k, i]));
+  for (const { a, c } of all) {
+    const type = typeOf(a), key = 'a:' + a.id, due = a.duedate || 0;
+    const hidden = type === 'info' || marks[key]?.hide;
+    const inAgenda = byKey.get(key);
+    if (inAgenda && (hidden || marks[key]?.done || !due)) { byKey.delete(key); continue; }
+    if (inAgenda && due) { inAgenda.ts = due; inAgenda.t = type; inAgenda.title = clip(a.name, 120); }
+    if (!old || hidden) continue;
+    const before = old.assigns[a.id];
+    const url = `${base}/mod/assign/view.php?id=${a.cmid}`;
+    const common = { ts: now, kind: type, title: a.name, course: snap.courses[c.id], courseId: c.id, due, ref: a.id, url };
+    if (!before) {
+      fresh.push({ k: `task_new:${a.id}`, t: 'task_new', ...common });
+      if (due > now && !inAgenda) byKey.set(key, { k: key, t: type, title: clip(a.name, 120), course: snap.courses[c.id], ts: due, a: a.id, c: c.id });
+    } else if ((before[2] || 0) !== due) {
+      fresh.push({ k: `task_due:${a.id}:${due}`, t: 'task_due', from: before[2] || 0, ...common });
+      if (due > now && !inAgenda && !marks[key]?.done) byKey.set(key, { k: key, t: type, title: clip(a.name, 120), course: snap.courses[c.id], ts: due, a: a.id, c: c.id });
     }
   }
 
-  // 2. Avisos: foros de novedades con debates nuevos (máx. 4 foros por revisión)
+  // 2. Avisos: foros de novedades con debates nuevos (máx. 4 foros y 3 lecturas con IA por revisión)
   const seen = new Set(snap.seen);
   const pending = (forums || []).filter((f) => f.type === 'news' && (snap.forums[f.id] ?? -1) !== (f.numdiscussions || 0));
-  let analysed = 0;
   for (const f of pending.slice(0, 4)) {
     if (!f.numdiscussions) { snap.forums[f.id] = 0; continue; }
     let res;
-    try { res = await moodle(env, token, 'mod_forum_get_forum_discussions', { forumid: f.id, sortorder: 3, page: 0, perpage: 5 }); } catch { continue; }
+    try { res = await moodle(env, token, 'mod_forum_get_forum_discussions', { forumid: f.id, sortorder: 3, page: 0, perpage: 6 }); } catch { continue; }
+    let complete = true;
     for (const d of res.discussions || []) {
       const did = d.discussion || d.id;
       if (seen.has(did)) continue;
-      seen.add(did); snap.seen.push(did);
       const course = snap.courses[f.course] || '';
       const notice = { id: did, subject: clip(d.subject || d.name, 140), text: htmlToText(d.message), created: d.created || now, course, courseId: f.course, url: `${base}/mod/forum/discuss.php?d=${did}` };
-      const silent = notice.created < user.created_at; // anterior al alta: no se notifica
-      if (!silent) fresh.push({ k: `notice:${did}`, t: 'notice', ts: notice.created, title: notice.subject, body: clip(notice.text, 220), course, courseId: f.course, ref: did, url: notice.url });
-      if ((!silent || notice.created > now - 30 * 86400) && analysed < 2 && !events.some((e) => e.noticeId === did)) {
-        analysed++;
-        const ev = await detectExam(env, notice);
-        if (ev && ev.start > now - 86400) {
-          events.push(ev);
-          fresh.push({ k: `exam:${did}`, t: 'exam', ts: now, title: ev.title, course, courseId: f.course, due: ev.start, allDay: ev.allDay, ref: ev.id, url: notice.url, silent });
+      const silent = notice.created < user.created_at; // anterior al alta: se lee, pero no se notifica
+      let found = null;
+      if (notice.created > now - 45 * 86400 && !events.some((e) => e.noticeId === did)) {
+        const hit = (await cacheGet(env, ['n:' + did]))['n:' + did];
+        if (hit) found = parse(hit, { items: [], source: 'ia' });
+        else if (aiCalls >= 3 && env.AI) { complete = false; break; } // el resto, en la próxima revisión
+        else {
+          found = await extractFromNotice(env, notice);
+          if (found.source !== 'filtro' && env.AI) aiCalls++;
+          if (found.source === 'ia') await cachePut(env, 'n:' + did, JSON.stringify(found));
         }
       }
+      seen.add(did); snap.seen.push(did);
+      if (!silent) fresh.push({ k: `notice:${did}`, t: 'notice', ts: notice.created, title: notice.subject, body: clip(notice.text, 220), course, courseId: f.course, ref: did, url: notice.url });
+      (found?.items || []).forEach((it, n) => {
+        if (it.start < now - 86400) return;
+        const dup = [...byKey.values()].some((x) => x.t === it.type && x.c === f.course && sameDay(x.ts, it.start)) || events.some((e) => (e.type || 'examen') === it.type && e.courseId === f.course && sameDay(e.start, it.start));
+        if (dup) return;
+        const ev = { id: n ? `d${did}_${n}` : 'd' + did, type: it.type, title: it.title, course, courseId: f.course, start: it.start, end: it.end, allDay: it.allDay, place: it.place, source: found.source, noticeId: did, url: notice.url, detected: now };
+        events.push(ev);
+        if (it.start > now) byKey.set(ev.id, { k: ev.id, t: it.type, title: it.title, course, ts: it.start, c: f.course, ...(it.allDay ? { allDay: 1 } : {}) });
+        fresh.push({ k: `det:${ev.id}`, t: 'detected', kind: it.type, ts: now, title: it.title, course, courseId: f.course, due: it.start, allDay: it.allDay, ref: ev.id, url: notice.url, silent });
+      });
     }
-    snap.forums[f.id] = f.numdiscussions || 0;
+    if (complete) snap.forums[f.id] = f.numdiscussions || 0;
   }
 
-  // 3. Notificaciones del campus: retroalimentación, notas y demás
+  // 3. Notificaciones del campus: calificaciones, retroalimentación y demás
   const notifs = notifData.notifications || [];
   for (const n of notifs) {
-    if (n.id <= snap.notifMax) continue;
-    if (!old) continue;
+    if (n.id <= snap.notifMax || !old) continue;
     let custom = {};
-    try { custom = JSON.parse(n.customdata || '{}'); } catch {}
+    try { custom = JSON.parse(n.customdata || '{}'); } catch { /* sin datos extra */ }
     if (n.component === 'mod_forum') continue; // ya cubierto por los avisos
     if (custom.messagetype === 'submissionreceipt') continue; // confirmación de tu propia entrega
     const isGrade = /grade/i.test(n.eventtype || '') || custom.messagetype === 'feedbackavailable';
@@ -410,55 +602,85 @@ export async function pollUser(env, user) {
   }
   for (const n of notifs) if (n.id > snap.notifMax) snap.notifMax = n.id;
 
-  // 4. Guardar y notificar
+  // 4. Recordatorios: cada elemento de la agenda avisa con la antelación elegida para su tipo
+  const reminders = [];
+  agenda = [...byKey.values()].filter((i) => i.ts > now);
+  const liveKeys = new Set(agenda.map((i) => i.k));
+  for (const k of Object.keys(sent)) if (!liveKeys.has(k.slice(0, k.lastIndexOf(':')))) delete sent[k];
+  for (const item of agenda) {
+    let best = null;
+    for (const off of prefs.rem[item.t] || []) {
+      const fire = item.ts - off, key = `${item.k}:${off}`;
+      if (fire > now || sent[key]) continue;
+      sent[key] = now;
+      if (now - fire <= 5400 && (!best || off < best)) best = off; // con más de 90 min de retraso ya no se envía
+    }
+    if (best) reminders.push({ item, off: best });
+  }
+  const notes = [];
+  let checks = 0;
+  for (const { item, off } of reminders.slice(0, 6)) {
+    if (item.t === 'entrega' && item.a && checks < 3) {
+      checks++;
+      try {
+        const st = await moodle(env, token, 'mod_assign_get_submission_status', { assignid: item.a });
+        const sub = st.lastattempt?.teamsubmission || st.lastattempt?.submission;
+        if (sub?.status === 'submitted') { agenda = agenda.filter((i) => i.k !== item.k); continue; } // ya entregada
+      } catch { /* si no se puede comprobar, se recuerda igualmente */ }
+    }
+    notes.push({ title: `${TYPE_LABEL[item.t]} ${OFFSET_LABEL[off]}${item.course ? ' · ' + clip(item.course, 34) : ''}`, body: `${item.title} — ${item.allDay ? day(item.ts) : when(item.ts)}`, tag: `rem:${item.k}`, url: '/#item=' + encodeURIComponent(item.k), urgent: off <= 10800 });
+  }
+
+  // 5. Guardar y notificar. Novedades y cambios de fecha se avisan siempre; avisos y calificaciones, según preferencias.
   const known = new Set(changes.map((c) => c.k));
   const added = fresh.filter((c) => !known.has(c.k));
   changes = added.concat(changes).sort((a, b) => b.ts - a.ts).slice(0, 80);
-  events = events.filter((e) => e.start > now - 30 * 86400).slice(-60);
-
-  const toPush = added.filter((c) => !c.silent && prefs[c.t]);
-  if (toPush.length && subs.length) {
-    const notes = toPush.length > 3
-      ? [{ title: `${toPush.length} novedades en el campus`, body: clip(toPush.map((c) => c.title).join(' · '), 180), tag: 'resumen', url: '/#novedades' }]
-      : toPush.map(noteFor);
+  events = events.filter((e) => e.start > now - 30 * 86400).slice(-80);
+  const toPush = added.filter((c) => !c.silent && (c.t === 'notice' ? prefs.notice : c.t === 'feedback' ? prefs.feedback : true));
+  if (subs.length) {
+    if (toPush.length > 3) notes.unshift({ title: `${toPush.length} novedades en el campus`, body: clip(toPush.map((c) => c.title).join(' · '), 180), tag: 'resumen', url: '/#avisos' });
+    else notes.unshift(...toPush.map(noteFor));
     for (const note of notes) subs = await pushAll(env, subs, note);
   }
-  await env.DB.prepare("UPDATE users SET snapshot = ?, events = ?, changes = ?, subs = ?, last_poll = ?, last_ok = ?, fails = 0, status = 'ok' WHERE id = ?")
-    .bind(JSON.stringify(snap), JSON.stringify(events), JSON.stringify(changes), JSON.stringify(subs), now, now, user.id).run();
-  return { status: 'ok', added: added.length, pushed: toPush.length };
+  await env.DB.prepare("UPDATE users SET snapshot = ?, events = ?, changes = ?, subs = ?, agenda = ?, sent = ?, last_poll = ?, last_ok = ?, fails = 0, status = 'ok' WHERE id = ?")
+    .bind(JSON.stringify(snap), JSON.stringify(events), JSON.stringify(changes), JSON.stringify(subs), JSON.stringify(agenda), JSON.stringify(sent), now, now, user.id).run();
+  return { status: 'ok', added: added.length, pushed: subs.length ? notes.length : 0, reminders: reminders.length, ai: aiCalls };
 }
 
 export function noteFor(c) {
   const course = c.course ? ` · ${clip(c.course, 38)}` : '';
+  const kind = TYPES.includes(c.kind) ? c.kind : 'entrega';
+  const fem = kind !== 'examen';
+  const link = '/#item=' + encodeURIComponent(c.t === 'detected' ? c.ref : 'a:' + c.ref);
   switch (c.t) {
-    case 'task_new': return { title: 'Nueva tarea' + course, body: c.due ? `${c.title} — entrega ${when(c.due)}` : c.title, tag: c.k, url: '/#tarea=' + c.ref };
-    case 'task_due': return { title: 'Plazo cambiado' + course, body: `${c.title}: ${c.from ? when(c.from) : 'sin fecha'} → ${c.due ? when(c.due) : 'sin fecha'}`, tag: c.k, url: '/#tarea=' + c.ref, urgent: true };
+    case 'task_new': return { title: `${fem ? 'Nueva' : 'Nuevo'} ${kind}${course}`, body: c.due ? `${c.title} — ${when(c.due)}` : c.title, tag: c.k, url: link };
+    case 'task_due': return { title: 'Fecha cambiada' + course, body: `${c.title}: ${c.from ? when(c.from) : 'sin fecha'} → ${c.due ? when(c.due) : 'sin fecha'}`, tag: c.k, url: link, urgent: true };
     case 'notice': return { title: 'Aviso' + course, body: c.title, tag: c.k, url: '/#aviso=' + c.ref };
-    case 'exam': return { title: 'Examen detectado' + course, body: `${c.title} — ${c.allDay ? day(c.due) : when(c.due)}. Añadido a tu calendario.`, tag: c.k, url: '/#calendario', urgent: true };
-    default: return { title: (c.kind === 'grade' ? 'Retroalimentación o nota' : 'Notificación del campus') + course, body: c.title, tag: c.k, url: '/#novedades' };
+    case 'detected': return { title: `${TYPE_LABEL[kind]} en un aviso${course}`, body: `${c.title} — ${c.allDay ? day(c.due) : when(c.due)}. ${fem ? 'Añadida' : 'Añadido'} a tu agenda.`, tag: c.k, url: link, urgent: kind === 'examen' };
+    default: return { title: (c.kind === 'grade' ? 'Calificación o retroalimentación' : 'Notificación del campus') + course, body: c.title, tag: c.k, url: '/#avisos' };
   }
 }
 
 /* ───────────────────────── calendario .ics ───────────────────────── */
 
 const icsEsc = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/([,;])/g, '\\$1');
-const icsFold = (line) => { const out = []; let l = line; while (enc.encode(l).length > 73) { let n = 60; out.push(l.slice(0, n)); l = ' ' + l.slice(n); } out.push(l); return out.join('\r\n'); };
+const icsFold = (line) => { const out = []; let l = line; while (enc.encode(l).length > 73) { out.push(l.slice(0, 60)); l = ' ' + l.slice(60); } out.push(l); return out.join('\r\n'); };
 const icsStamp = (ts) => new Date(ts * 1000).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+/** Calendario con lo detectado en avisos y lo añadido a mano. */
 export function buildIcs(events) {
-  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Plazo//Campus UMH//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:Plazo · exámenes detectados', 'X-WR-TIMEZONE:Europe/Madrid', 'REFRESH-INTERVAL;VALUE=DURATION:PT1H', 'X-PUBLISHED-TTL:PT1H'];
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Plazo//Campus UMH//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:Plazo', 'X-WR-TIMEZONE:Europe/Madrid', 'REFRESH-INTERVAL;VALUE=DURATION:PT1H', 'X-PUBLISHED-TTL:PT1H'];
   for (const e of events) {
+    const label = TYPE_LABEL[e.type || 'examen'];
     lines.push('BEGIN:VEVENT', `UID:${e.id}@plazo`, `DTSTAMP:${icsStamp(e.detected || nowSec())}`);
     if (e.allDay) {
-      const d = madridYMD(e.start).replace(/-/g, '');
-      const next = madridYMD(e.start + 26 * 3600).replace(/-/g, '');
-      lines.push(`DTSTART;VALUE=DATE:${d}`, `DTEND;VALUE=DATE:${next}`);
+      lines.push(`DTSTART;VALUE=DATE:${madridYMD(e.start).replace(/-/g, '')}`, `DTEND;VALUE=DATE:${madridYMD(e.start + 26 * 3600).replace(/-/g, '')}`);
     } else {
-      lines.push(`DTSTART:${icsStamp(e.start)}`, `DTEND:${icsStamp(e.end || e.start + 7200)}`);
+      lines.push(`DTSTART:${icsStamp(e.start)}`, `DTEND:${icsStamp(e.end || e.start + (e.type === 'entrega' ? 900 : 7200))}`);
     }
-    lines.push(icsFold(`SUMMARY:${icsEsc(`${e.title}${e.course ? ' · ' + e.course : ''}`)}`));
-    lines.push(icsFold(`DESCRIPTION:${icsEsc(`Detectado por Plazo en un aviso del campus (${e.source === 'ia' ? 'IA' : 'reglas'}). Comprueba la fecha en el aviso original: ${e.url}`)}`));
+    lines.push(icsFold(`SUMMARY:${icsEsc(`${label}: ${e.title}${e.course ? ' · ' + e.course : ''}`)}`));
+    lines.push(icsFold(`DESCRIPTION:${icsEsc(e.manual ? (e.note || 'Añadido a mano en Plazo.') : `Detectado por Plazo en un aviso del campus (${e.source === 'ia' ? 'IA' : 'reglas'}). Comprueba la fecha en el aviso original: ${e.url}`)}`));
     if (e.place) lines.push(icsFold(`LOCATION:${icsEsc(e.place)}`));
-    lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', 'DESCRIPTION:Examen', 'TRIGGER:-P1D', 'END:VALARM', 'END:VEVENT');
+    lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${label}`, 'TRIGGER:-P1D', 'END:VALARM', 'END:VEVENT');
   }
   lines.push('END:VCALENDAR');
   return lines.join('\r\n') + '\r\n';
@@ -474,17 +696,17 @@ async function auth(env, request) {
   if (!user) return null;
   return safeEqual(await sign(env, `s:${user.id}:${user.salt}`), m[2]) ? user : null;
 }
-const readJson = async (request) => { try { const t = await request.text(); return t.length > 20000 ? null : JSON.parse(t); } catch { return null; } };
+const readJson = async (request, max = 20000) => { try { const t = await request.text(); return t.length > max ? null : JSON.parse(t); } catch { return null; } };
 
 async function api(request, env, url) {
   const path = url.pathname.replace(/\/+$/, '');
   const method = request.method;
 
   if (path === '/api/config' && method === 'GET') {
-    let ready = true, reason = null, pub = null;
-    try { await masterKeys(env); pub = (await vapid(env)).pub; } catch (e) { ready = false; reason = e.message; }
+    let ready = true, reason = null, pub = null, keySource = null;
+    try { keySource = (await masterSecret(env)).source; pub = (await vapid(env)).pub; } catch (e) { ready = false; reason = e.message; }
     if (ready && !(await getConfig(env, 'origin'))) await setConfig(env, 'origin', url.origin);
-    return json({ ready, reason, vapidPublicKey: pub, version: VERSION, ai: !!env.AI, pollMinutes: +(env.POLL_MINUTES || 10) });
+    return json({ ready, reason, vapidPublicKey: pub, version: VERSION, ai: !!env.AI, pollMinutes: +(env.POLL_MINUTES || 10), keySource });
   }
 
   if (path === '/api/register' && method === 'POST') {
@@ -515,7 +737,24 @@ async function api(request, env, url) {
 
   if (path === '/api/feed' && method === 'GET') {
     const total = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE status = 'ok'").first()).n;
-    return json({ status: user.status, events: parse(user.events, []), changes: parse(user.changes, []), prefs: { ...DEFAULT_PREFS, ...parse(user.prefs, {}) }, devices: parse(user.subs, []).length, lastOk: user.last_ok, cadenceMinutes: Math.max(+(env.POLL_MINUTES || 10), total), feedPath: `/cal/${user.id}-${user.feed_secret}.ics` });
+    const cfg = {};
+    for (const row of (await env.DB.prepare("SELECT k, v FROM config WHERE k IN ('ai_ok', 'ai_err')").all()).results || []) cfg[row.k] = row.v;
+    return json({
+      status: user.status, events: parse(user.events, []), changes: parse(user.changes, []), cls: parse(user.snapshot, {})?.cls || {},
+      prefs: cleanPrefs(parse(user.prefs, {})), ustate: cleanUstate(parse(user.ustate, {})), devices: parse(user.subs, []).length,
+      lastOk: user.last_ok, cadenceMinutes: Math.max(+(env.POLL_MINUTES || 10), total), feedPath: `/cal/${user.id}-${user.feed_secret}.ics`,
+      ai: { on: !!env.AI, ok: +(cfg.ai_ok || 0), err: parse(cfg.ai_err, null) }, keySource: (await masterSecret(env)).source, version: VERSION,
+    });
+  }
+  if (path === '/api/sync' && method === 'POST') {
+    const body = await readJson(request, 200000);
+    if (!body) return fail(400, 'badbody', 'Datos no válidos.');
+    const stored = cleanUstate(parse(user.ustate, {}));
+    const incoming = body.ustate ? cleanUstate(body.ustate) : null;
+    const ustate = incoming && incoming.rev >= stored.rev ? incoming : stored;
+    const agenda = Array.isArray(body.agenda) ? cleanAgenda(body.agenda) : parse(user.agenda, []);
+    await env.DB.prepare('UPDATE users SET ustate = ?, agenda = ? WHERE id = ?').bind(JSON.stringify(ustate), JSON.stringify(agenda), user.id).run();
+    return json({ ok: true, rev: ustate.rev, agenda: agenda.length });
   }
   if (path === '/api/subscribe' && method === 'POST') {
     const body = await readJson(request);
@@ -534,21 +773,21 @@ async function api(request, env, url) {
   }
   if (path === '/api/prefs' && method === 'POST') {
     const body = await readJson(request);
-    const prefs = {};
-    for (const k of Object.keys(DEFAULT_PREFS)) prefs[k] = body?.prefs?.[k] !== false;
+    const prefs = cleanPrefs(body?.prefs || {});
     await env.DB.prepare('UPDATE users SET prefs = ? WHERE id = ?').bind(JSON.stringify(prefs), user.id).run();
     return json({ ok: true, prefs });
   }
   if (path === '/api/events/dismiss' && method === 'POST') {
     const body = await readJson(request);
     const events = parse(user.events, []).filter((e) => e.id !== body?.id);
-    await env.DB.prepare('UPDATE users SET events = ? WHERE id = ?').bind(JSON.stringify(events), user.id).run();
+    const agenda = parse(user.agenda, []).filter((i) => i.k !== body?.id);
+    await env.DB.prepare('UPDATE users SET events = ?, agenda = ? WHERE id = ?').bind(JSON.stringify(events), JSON.stringify(agenda), user.id).run();
     return json({ ok: true });
   }
   if (path === '/api/test-push' && method === 'POST') {
     const before = parse(user.subs, []);
     if (!before.length) return fail(409, 'nodevices', 'Este usuario no tiene ningún dispositivo con notificaciones activadas.');
-    const subs = await pushAll(env, before, { title: 'Plazo funciona', body: 'Así te llegarán las tareas nuevas, los cambios de plazo y los avisos.', tag: 'prueba', url: '/' });
+    const subs = await pushAll(env, before, { title: 'Plazo funciona', body: 'Así te llegarán los recordatorios, las novedades y los avisos.', tag: 'prueba', url: '/' });
     if (subs.length !== before.length) await env.DB.prepare('UPDATE users SET subs = ? WHERE id = ?').bind(JSON.stringify(subs), user.id).run();
     return json({ ok: true, devices: subs.length });
   }
@@ -562,9 +801,11 @@ async function api(request, env, url) {
 async function calendar(env, url) {
   const m = /^\/cal\/(\d+)-([\w-]+)\.ics$/.exec(url.pathname);
   if (!m) return new Response('No encontrado', { status: 404 });
-  const user = await env.DB.prepare('SELECT feed_secret, events FROM users WHERE id = ?').bind(+m[1]).first();
+  const user = await env.DB.prepare('SELECT feed_secret, events, ustate FROM users WHERE id = ?').bind(+m[1]).first();
   if (!user || !safeEqual(user.feed_secret, m[2])) return new Response('No encontrado', { status: 404 });
-  return new Response(buildIcs(parse(user.events, [])), { headers: { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'private, max-age=900' } });
+  const st = cleanUstate(parse(user.ustate, {}));
+  const manual = st.manual.filter((x) => !st.marks['u:' + x.id]?.hide).map((x) => ({ id: 'u' + x.id, type: x.type, title: x.title, start: x.ts, allDay: x.allDay, place: x.place, note: x.note, manual: true }));
+  return new Response(buildIcs([...parse(user.events, []), ...manual]), { headers: { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'private, max-age=900' } });
 }
 
 export default {
