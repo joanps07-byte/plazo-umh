@@ -1,4 +1,4 @@
-# Plazo 1.1
+# Plazo 1.2
 
 Tus entregas, exámenes y actividades del Campus Virtual UMH en una app instalable en el iPhone. Lee los avisos por ti, clasifica lo que publica cada profesor y te recuerda cada cosa con la antelación que elijas. App **no oficial**: no pertenece a la Universidad Miguel Hernández.
 
@@ -41,22 +41,26 @@ iPhone (app instalada)  ──lee directamente──▶  campus.umh.es (API móv
 
 Cómo decide la app el tipo de cada cosa, por orden: lo que tú hayas corregido a mano; la clasificación de la IA; reglas sobre el nombre (por ejemplo, «Calificaciones…» es informativo y «Examen parcial…» es un examen). La IA clasifica cada tarea y lee cada aviso una sola vez para todos los compañeros de la asignatura, así el cupo gratuito rinde mucho más.
 
-## Actualizar desde la versión 1.0
+## Actualizar a la versión 1.2
 
-Sustituye en tu repositorio de GitHub estos archivos por los nuevos. **No toques `wrangler.toml`**: el tuyo contiene el identificador de tu base de datos.
+1. **Archivos.** En GitHub, **Add file → Upload files**, arrastra las carpetas `app`, `worker` y `tests` de la actualización y pulsa **Commit changes**.
+2. **`wrangler.toml`.** No lo sustituyas, porque el tuyo tiene el identificador de tu base de datos. Ábrelo en GitHub con el lápiz y añade, justo antes de la línea `[observability]`:
+   ```
+   [[services]]
+   binding = "SELF"
+   service = "plazo-umh"
+   ```
+   Si el despliegue fallara por estas líneas, bórralas: Plazo funciona igual, revisando a una persona por minuto.
+3. **Clave de Groq (gratis).** En console.groq.com → **API Keys → Create API Key**. Cópiala y en Cloudflare: Worker → **Settings → Variables and Secrets → Add**, tipo **Secret**, nombre `GROQ_API_KEY`. Sin ella, la IA usa solo Cloudflare.
+4. **Comprobación.** En la app: Ajustes → Servidor de Plazo → **Motores de IA** debe decir «Groq + Cloudflare». Pulsa **Volver a leer todos los avisos**.
 
-| Archivo | Qué cambia |
-|---|---|
-| `app/app.js` | Toda la app: tipos, agenda, añadir a mano, marcar como hecha, recordatorios |
-| `app/app.css` | Estilos de lo anterior |
-| `app/demo.js` | Demostración actualizada |
-| `app/sw.js` | Fuerza la descarga de la versión nueva en cada dispositivo |
-| `worker/index.js` | IA, recordatorios, clave automática y actualización de la base de datos |
-| `tests/…`, `README.md` | Opcionales |
+### Cómo funciona la IA desde la 1.2
 
-En GitHub: **Add file → Upload files**, arrastra las carpetas `app`, `worker` y `tests` de la actualización y pulsa **Commit changes**. Cloudflare despliega solo en un par de minutos. La base de datos se actualiza sola en la primera petición.
-
-En el iPhone: abre Plazo, ciérrala del todo y vuelve a abrirla. En Ajustes debe aparecer «Plazo 1.1.0».
+- **Orden**: Groq (gpt-oss-120b, Llama 3.3 70B y gpt-oss-20b, cada uno con su propio cupo) → Cloudflare Workers AI (gpt-oss-120b y Llama 3.3 70B) → reglas. Cuando un motor agota su cupo, se pausa y se pasa al siguiente.
+- **Qué se lee**: avisos de los últimos 5 meses, completos hasta unas 12.000 letras, hasta 15 por asignatura. Cada aviso y cada tarea se analizan una sola vez para todos los alumnos de esa asignatura.
+- **Estado visible**: cada aviso muestra si la IA lo ha leído y qué encontró. Ajustes muestra los motores, cuál respondió por última vez y si alguno está en pausa.
+- **Velocidad**: el servidor revisa hasta `POLLERS` personas por minuto (6 por defecto), cada una en su propia ejecución. Con 60 usuarios, cada uno se revisa cada 10 minutos.
+- **Variables opcionales**: `GROQ_MODELS` y `CF_AI_MODELS` (listas separadas por comas), `AI_PER_POLL` (lecturas con IA por revisión, 4 por defecto) y `POLLERS`.
 
 ## Puesta en marcha desde cero (unos 20 minutos, sin instalar nada)
 
@@ -78,9 +82,9 @@ El campus solo permite entrar por el inicio de sesión único de la UMH, con su 
 
 ## Límites que conviene conocer
 
-- **Precisión de unos 10 minutos.** El vigilante revisa a un usuario por minuto y deja al menos 10 minutos entre dos revisiones de la misma persona; con 60 usuarios, cada uno se revisa cada hora. Un recordatorio de «1 hora antes» puede llegar con ese retraso. Es el precio del plan gratuito.
+- **Precisión de unos 10 minutos.** Cada persona se revisa como mucho cada 10 minutos. Con más de 60 usuarios, el intervalo crece (con 120, cada 20 minutos) salvo que subas `POLLERS`, vigilando en **Metrics** que no aparezcan errores de CPU.
 - **La IA se equivoca a veces.** Por eso todo lo detectado indica su origen, enlaza al aviso y se corrige con un toque. Lo que tú corriges manda siempre.
-- **Lectura inicial gradual.** Al darte de alta se leen los avisos de los últimos 45 días, tres por revisión, sin notificarlos.
+- **Lectura inicial gradual.** Al darte de alta se leen los avisos de los últimos 5 meses, cuatro por revisión, sin notificarlos. Los adjuntos (PDF) no se leen.
 - **Cupo diario de IA.** Si se agota o falla, se usan reglas; Ajustes → Servidor de Plazo muestra el estado.
 - **«Entregada» es una deducción.** El campus marca qué tareas requieren acción; las que ya no la requieren se muestran como entregadas. Antes de recordarte una entrega, el servidor comprueba en el campus que no esté ya enviada.
 - **Comentarios en una entrega**: llegan cuando el campus genera una notificación. Los hilos que el campus no notifica no se vigilan.
@@ -91,7 +95,7 @@ Si compartes tu dirección con otros estudiantes, tu cuenta de Cloudflare guarda
 
 - **Qué se guarda en el servidor**: acceso al campus cifrado, nombre, suscripción push, lista de tareas con sus fechas y tipo, agenda para los recordatorios, lo añadido a mano, lo marcado como hecho u oculto, identificadores de avisos vistos y las últimas novedades.
 - **Qué no se guarda**: contraseñas, códigos de un solo uso ni el texto completo de los avisos.
-- **Qué se envía a la IA** (Workers AI de Cloudflare): el texto de los avisos que mencionan fechas, y el nombre y principio de la descripción de las tareas dudosas. Sin nombres de estudiantes.
+- **Qué se envía a la IA** (Groq y Workers AI de Cloudflare; ninguno entrena con lo que recibe según sus condiciones): el texto de los avisos que mencionan fechas, y el nombre y principio de la descripción de las tareas dudosas. Sin nombres de estudiantes.
 - **Sin servidor**: Ajustes → «Usar solo este dispositivo» borra los datos del servidor. Se pierden la IA, los recordatorios y las notificaciones; la app sigue clasificando por reglas.
 - **Borrado total**: Ajustes → «Desconectar y borrar mis datos».
 - Antes de difundirla, cuéntaselo a los Servicios Informáticos de la UMH. Usa la misma API que la app oficial, pero la universidad puede tener normas sobre apps de terceros.
@@ -102,12 +106,12 @@ Si compartes tu dirección con otros estudiantes, tu cuenta de Cloudflare guarda
 Probado:
 
 - Contra el campus real, con una sesión de estudiante: la API móvil (Moodle 4.5) devuelve tareas, plazos, avisos, notificaciones, calendario y estado de entrega con el formato que usa la app.
-- 23 pruebas automáticas del Worker (`npm test`): cifrado Web Push contra el vector del RFC 8291, clave automática, actualización de una base de datos de la versión 1, registro y sesiones, clasificación por reglas y con IA, lectura de avisos, novedades por tipo, recordatorios (una sola vez, con antelación, y no si ya está entregada), preferencias, calendario `.ics`, caducidad del acceso y borrado de cuenta.
+- 29 pruebas automáticas del Worker (`npm test`): cifrado Web Push contra el vector del RFC 8291, clave automática, actualización de una base de datos de la versión 1, registro y sesiones, clasificación por reglas y con IA, cadena de motores con pausa por cupo, lectura y relectura de avisos, revisiones en paralelo, novedades por tipo, recordatorios (una sola vez, con antelación, y no si ya está entregada), preferencias, calendario `.ics`, caducidad del acceso y borrado de cuenta.
 - La interfaz en un navegador con tamaño de iPhone, con campus y servidor simulados: conexión, tipos, marcar como hecha, reclasificar, añadir a mano, filtros del calendario, recordatorios y filtrado de HTML peligroso.
 
 Sin probar, porque requiere tu despliegue y un iPhone:
 
-- La IA real de Cloudflare con avisos reales: las pruebas usan una IA simulada. La calidad de la clasificación hay que verla con tus asignaturas.
+- Groq y Cloudflare reales con avisos reales: las pruebas usan IA simulada. El binding SELF (revisiones en paralelo) solo se comprueba al desplegar. La calidad de la clasificación hay que verla con tus asignaturas.
 - La llegada de notificaciones push a un iPhone y el consumo real de CPU en el plan gratuito.
 
 ## Si algo falla
@@ -117,7 +121,9 @@ Sin probar, porque requiere tu despliegue y un iPhone:
 | «No se pudo conectar con el servidor de Plazo» | Abre `/api/config`. Si no dice `"ready":true`, el campo `reason` explica qué falta |
 | Error 503 «Falta la base de datos» | El `database_id` de `wrangler.toml` no es el de tu D1 |
 | Ajustes sigue diciendo 1.0 | Cierra la app del todo y ábrela dos veces. Si no, borra el icono y vuelve a añadirla desde Safari |
-| «Lectura con IA: con fallos» | El mensaje indica el motivo (cupo agotado, modelo no disponible). Puedes fijar otro modelo con la variable `AI_MODEL` |
+| «Lectura con IA: con fallos» | El mensaje indica el motivo (clave de Groq no válida, cupo agotado, modelo no disponible). Los modelos se cambian con `GROQ_MODELS` y `CF_AI_MODELS` |
+| «Motores de IA: Cloudflare (falta la clave de Groq)» | Falta el secreto `GROQ_API_KEY`, o se añadió como variable en vez de como **Secret** |
+| Un examen de un aviso no aparece | Abre el aviso: indica si la IA lo leyó y qué encontró. Si dice «aún no», espera; si no encontró nada, añádelo con + |
 | No aparece el interruptor de notificaciones o da error | La app debe estar instalada en la pantalla de inicio y abierta desde el icono |
 | No llegan notificaciones | Worker → **Logs**: cada revisión escribe una línea `revisión …`. Si aparece «Exceeded CPU», sube `POLL_MINUTES` |
 | Algo está mal clasificado | Ábrelo y elige el tipo correcto en «Esto es…» |
