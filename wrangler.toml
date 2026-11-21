@@ -29,6 +29,10 @@ MOODLE_URL = "https://campus.umh.es"
 POLL_MINUTES = "10"   # minutos mínimos entre dos revisiones del mismo usuario
 MAX_USERS = "150"     # tope de usuarios de este servidor
 
+[[services]]
+binding = "SELF"
+service = "plazo-umh"
+
 [observability]
 enabled = true
 
