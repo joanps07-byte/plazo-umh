@@ -6,7 +6,7 @@
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const TZ = 'Europe/Madrid';
 
 /* ───────────────────────── utilidades ───────────────────────── */
@@ -286,22 +286,92 @@ export function ruleType(name) {
   return { type: 'entrega', sure: false };
 }
 
-let aiOkWritten = 0;
-async function aiJson(env, system, user, schema, maxTokens) {
-  try {
-    const out = await env.AI.run(env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      response_format: { type: 'json_schema', json_schema: schema }, max_tokens: maxTokens, temperature: 0,
-    });
-    let r = out?.response ?? out;
-    if (typeof r === 'string') r = JSON.parse(r.slice(r.indexOf('{'), r.lastIndexOf('}') + 1));
-    if (!r || typeof r !== 'object') throw new Error('respuesta vacía');
-    if (env.DB && nowSec() - aiOkWritten > 3600) { aiOkWritten = nowSec(); await setConfig(env, 'ai_ok', String(aiOkWritten)).catch(() => {}); }
-    return r;
-  } catch (e) {
-    if (env.DB) await setConfig(env, 'ai_err', JSON.stringify({ at: nowSec(), msg: clip(e.message, 160) })).catch(() => {});
-    throw e;
+/* Proveedores de IA, por orden: Groq (si hay GROQ_API_KEY) → Cloudflare Workers AI → reglas.
+   Si uno agota su cupo, se pausa un rato y se pasa al siguiente. */
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const list = (v, d) => String(v || d).split(',').map((x) => x.trim()).filter(Boolean);
+export function aiProviders(env) {
+  const out = [];
+  if (env.GROQ_API_KEY) for (const m of list(env.GROQ_MODELS, 'openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b')) out.push({ kind: 'groq', model: m, id: 'groq:' + m });
+  if (env.AI) for (const m of list(env.CF_AI_MODELS || env.AI_MODEL, '@cf/openai/gpt-oss-120b,@cf/meta/llama-3.3-70b-instruct-fp8-fast')) out.push({ kind: 'cf', model: m, id: 'cf:' + m });
+  return out;
+}
+const hasAI = (env) => !!(env.GROQ_API_KEY || env.AI);
+class AiError extends Error { constructor(msg, wait = 0) { super(msg); this.wait = wait; } }
+const toMidnightUTC = () => 86400 - (nowSec() % 86400) + 60;
+
+function looseJson(r) {
+  if (r && typeof r === 'object') return r;
+  const t = String(r ?? ''), a = t.indexOf('{'), b = t.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new AiError('la IA no devolvió JSON');
+  return JSON.parse(t.slice(a, b + 1));
+}
+function cfText(out) {
+  if (out?.response !== undefined && out?.response !== null) return out.response;
+  const c = out?.choices?.[0]?.message?.content;
+  if (c) return c;
+  for (const o of Array.isArray(out?.output) ? out.output : []) for (const part of o?.content || []) if (part?.text) return part.text;
+  return out?.output_text ?? out;
+}
+async function callGroq(env, p, system, user, maxTokens) {
+  const oss = /gpt-oss/.test(p.model);
+  const body = { model: p.model, temperature: 0, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], max_completion_tokens: maxTokens + (oss ? 2500 : 0), response_format: { type: 'json_object' } };
+  if (oss) { body.reasoning_effort = 'medium'; body.include_reasoning = false; }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try { res = await fetch(GROQ_URL, { method: 'POST', headers: { authorization: 'Bearer ' + env.GROQ_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(45000) }); }
+    catch (e) { throw new AiError('Groq no responde: ' + e.message, 60); }
+    const text = await res.text();
+    if (res.status === 429) {
+      const ra = +res.headers.get('retry-after');
+      throw new AiError(`Groq: cupo de ${p.model} agotado de momento`, ra > 0 ? Math.min(ra + 5, 86400) : /per day|\b(TPD|RPD)\b/i.test(text) ? 3600 : 120);
+    }
+    if (res.status === 401 || res.status === 403) throw new AiError('Groq: la clave GROQ_API_KEY no es válida', 3600);
+    if (res.status === 404) throw new AiError(`Groq: el modelo ${p.model} no existe`, 86400);
+    if (res.status === 400 && attempt === 0 && /json|response_format|validate/i.test(text)) { delete body.response_format; continue; }
+    if (!res.ok) throw new AiError(`Groq respondió ${res.status}: ${clip(text, 120)}`, res.status >= 500 ? 60 : 0);
+    return looseJson(JSON.parse(text).choices?.[0]?.message?.content);
   }
+  throw new AiError('Groq no devolvió JSON');
+}
+async function callCf(env, p, system, user, schema, maxTokens) {
+  const base = { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], max_tokens: maxTokens + (/gpt-oss/.test(p.model) ? 2500 : 0), temperature: 0 };
+  let out;
+  try { out = await env.AI.run(p.model, { ...base, response_format: { type: 'json_schema', json_schema: schema } }); }
+  catch (e) {
+    if (/neuron|quota|daily|\b429\b|limit exceeded/i.test(e.message)) throw new AiError('Cloudflare AI: cupo diario agotado', toMidnightUTC());
+    try { out = await env.AI.run(p.model, base); } catch (e2) { throw new AiError(`Cloudflare AI (${p.model}): ${clip(e2.message, 100)}`, /not found|no such model/i.test(e2.message) ? 86400 : 0); }
+  }
+  return looseJson(cfText(out));
+}
+
+/** Pregunta a la primera IA disponible. Devuelve { data, by } o lanza un error si ninguna responde. */
+async function aiJson(env, system, user, schema, maxTokens) {
+  const providers = aiProviders(env);
+  if (!providers.length) throw new AiError('no hay ninguna IA configurada');
+  const now = nowSec();
+  const blocks = env.DB ? parse(await getConfig(env, 'ai_block').catch(() => null), {}) : {};
+  const sys = `${system}\nResponde solo con un objeto JSON válido que siga este esquema: ${JSON.stringify(schema.schema || schema)}`;
+  let lastErr = null, changed = false;
+  for (const p of providers) {
+    if ((blocks[p.id] || 0) > now) continue;
+    try {
+      const data = p.kind === 'groq' ? await callGroq(env, p, sys, user, maxTokens) : await callCf(env, p, sys, user, schema, maxTokens);
+      if (!data || typeof data !== 'object') throw new AiError('respuesta vacía');
+      if (changed) await setConfig(env, 'ai_block', JSON.stringify(blocks)).catch(() => {});
+      if (env.DB) await setConfig(env, 'ai_ok', JSON.stringify({ at: now, by: p.id })).catch(() => {});
+      return { data, by: p.id };
+    } catch (e) {
+      lastErr = e;
+      console.log('IA', p.id, e.message);
+      if (e.wait > 0 && env.DB) { blocks[p.id] = now + e.wait; changed = true; }
+    }
+  }
+  if (env.DB) {
+    if (changed) await setConfig(env, 'ai_block', JSON.stringify(blocks)).catch(() => {});
+    await setConfig(env, 'ai_err', JSON.stringify({ at: now, msg: clip(lastErr?.message || 'todas las IA están en pausa por cupo', 160) })).catch(() => {});
+  }
+  throw lastErr || new AiError('todas las IA están en pausa por cupo');
 }
 
 const CLASS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, tipo: { type: 'string', enum: ['entrega', 'examen', 'actividad', 'informativo'] } }, required: ['id', 'tipo'] } } }, required: ['items'] };
@@ -315,7 +385,7 @@ Responde solo con JSON: {"items":[{"id":número,"tipo":"..."}]} con todos los el
 /** Clasifica con IA una lista de tareas [{id, name, intro, course}]. Devuelve {id: tipo}. Lanza error si la IA falla. */
 export async function classifyAssignments(env, list) {
   const user = list.map((a) => `id ${a.id} | asignatura: ${clip(a.course, 60)} | nombre: ${clip(a.name, 140)}${a.intro ? ` | descripción: ${clip(a.intro, 240)}` : ''}`).join('\n');
-  const r = await aiJson(env, CLASS_PROMPT, user, CLASS_SCHEMA, 60 + list.length * 24);
+  const { data: r } = await aiJson(env, CLASS_PROMPT, user, CLASS_SCHEMA, 80 + list.length * 24);
   const out = {};
   const ids = new Set(list.map((a) => a.id));
   for (const it of Array.isArray(r.items) ? r.items : []) {
@@ -368,18 +438,19 @@ const NOTICE_PROMPT = `Lees avisos que los profesores publican en el campus virt
 - "examen": examen, parcial, prueba, control, test, defensa o recuperación al que hay que presentarse.
 - "entrega": algo que el estudiante debe entregar o subir; la fecha es la fecha límite.
 - "actividad": seminario, charla, taller, visita, exposición, tutoría grupal, revisión de examen, clase extraordinaria o cambio de fecha de una sesión.
-No incluyas: publicación de notas, calificaciones o material; hechos ya pasados; nada que no tenga fecha. No inventes fechas ni horas: si el aviso no da la hora o el lugar, deja ese campo como cadena vacía. Resuelve expresiones como «mañana» o «el próximo jueves» a partir de la fecha de publicación. Títulos cortos y concretos (máximo 8 palabras), sin el nombre de la asignatura. Como máximo 4 elementos. Si no hay nada que extraer, devuelve {"items":[]}. Responde solo con JSON.`;
+No incluyas: publicación de notas, calificaciones o material; hechos ya pasados; nada que no tenga fecha. No inventes fechas ni horas: si el aviso no da la hora o el lugar, deja ese campo como cadena vacía. Resuelve expresiones como «mañana» o «el próximo jueves» a partir de la fecha de publicación. Si el aviso cambia la fecha de algo anunciado antes, da solo la fecha nueva. Si un mismo acto tiene varias fechas (por grupos o turnos), incluye cada una con su grupo en el título. Títulos cortos y concretos (máximo 8 palabras), sin el nombre de la asignatura. Como máximo 6 elementos. Si no hay nada que extraer, devuelve {"items":[]}. Responde solo con JSON.`;
 
 /** Lee un aviso y devuelve los exámenes, entregas y actividades con fecha que anuncia. */
 export async function extractFromNotice(env, notice) {
-  const text = clip(`${notice.subject}\n${notice.text}`, 6000);
+  const text = clip(`${notice.subject}\n${notice.text}`, 12000);
   if (!NOTICE_WORDS.test(text) || !DATEISH.test(text)) return { items: [], source: 'filtro' };
-  let raw = null, source = 'reglas';
-  if (env.AI) {
+  let raw = null, source = 'reglas', by = null;
+  if (hasAI(env)) {
     try {
       const weekday = new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday: 'long' }).format(new Date(notice.created * 1000));
-      const r = await aiJson(env, NOTICE_PROMPT, `Fecha de publicación: ${madridYMD(notice.created)} (${weekday})\nAsignatura: ${notice.course}\n\nAviso:\n${text}`, NOTICE_SCHEMA, 500);
-      raw = (Array.isArray(r.items) ? r.items : []).slice(0, 4).map((it) => ({
+      const res = await aiJson(env, NOTICE_PROMPT, `Fecha de publicación: ${madridYMD(notice.created)} (${weekday})\nAsignatura: ${notice.course}\n\nAviso:\n${text}`, NOTICE_SCHEMA, 700);
+      const r = res.data; by = res.by;
+      raw = (Array.isArray(r.items) ? r.items : []).slice(0, 6).map((it) => ({
         type: it.tipo, title: clip(it.titulo || notice.subject, 90), date: it.fecha,
         time: /^\d{1,2}:\d{2}$/.test(it.hora_inicio || '') ? it.hora_inicio.padStart(5, '0') : null,
         end: /^\d{1,2}:\d{2}$/.test(it.hora_fin || '') ? it.hora_fin.padStart(5, '0') : null,
@@ -404,14 +475,14 @@ export async function extractFromNotice(env, notice) {
     if (it.time && it.end) { const [eh, em] = it.end.split(':').map(Number); end = madridToEpoch(y, m, d, eh, em); if (end <= start) end = null; }
     items.push({ type: it.type, title: it.title, start, end, allDay: !it.time, place: it.place });
   }
-  return { items, source };
+  return { items, source, ...(by ? { by } : {}) };
 }
 
-async function cacheGet(env, keys) {
+async function cacheGet(env, keys, since = 0) {
   const out = {};
   if (!keys.length) return out;
-  const r = await env.DB.prepare(`SELECT k, v FROM ai_cache WHERE k IN (${keys.map(() => '?').join(',')})`).bind(...keys).all();
-  for (const row of r.results || []) out[row.k] = row.v;
+  const r = await env.DB.prepare(`SELECT k, v, at FROM ai_cache WHERE k IN (${keys.map(() => '?').join(',')})`).bind(...keys).all();
+  for (const row of r.results || []) if (row.at >= since) out[row.k] = row.v;
   return out;
 }
 const cachePut = (env, k, v) => env.DB.prepare('INSERT INTO ai_cache (k, v, at) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, at = excluded.at').bind(k, v, nowSec()).run();
@@ -463,6 +534,16 @@ function cleanUstate(u) {
   return { rev: Math.floor(+u?.rev || 0), manual, marks };
 }
 const sameDay = (a, b) => madridYMD(a) === madridYMD(b);
+/** «MODELOS LINEALES (2345_Grado en ... 2026/2027)» → «Modelos Lineales». Solo para mostrar: la identidad es siempre el número de asignatura. */
+export function tidyCourse(full) {
+  let s = String(full || '').replace(/\s*\([^()]*\)\s*$/, '').trim() || String(full || '');
+  if (s.length > 3 && s === s.toUpperCase()) {
+    s = s.toLowerCase().replace(/(^|[\s\-/])(\p{L})/gu, (m, a, b) => a + b.toUpperCase())
+      .replace(/(\s)(De|Del|La|Las|El|Los|Y|E|En|A|Con|Para|Por)(?=\s)/g, (m, sp, w) => sp + w.toLowerCase());
+  }
+  return s;
+}
+const WINDOW = 150 * 86400; // avisos que se analizan: los de los últimos 5 meses
 
 /* ───────────────────────── revisión de un usuario ───────────────────────── */
 
@@ -499,13 +580,15 @@ export async function pollUser(env, user) {
   }
 
   const fresh = [];
-  const snap = { v: 2, courses: {}, assigns: {}, cls: old?.cls ? { ...old.cls } : {}, forums: old?.forums ? { ...old.forums } : {}, seen: old?.seen ? old.seen.slice(-400) : [], notifMax: old?.notifMax || 0 };
+  const snap = { v: 3, courses: {}, assigns: {}, cls: old?.cls ? { ...old.cls } : {}, forums: old?.forums ? { ...old.forums } : {}, seen: old?.seen ? old.seen.slice(-400) : [], nst: old?.nst ? { ...old.nst } : {}, notifMax: old?.notifMax || 0, rereadAt: old?.rereadAt || 0, reseen: old?.reseen || [] };
   let aiCalls = 0;
+  const AI_PER_POLL = Math.max(1, +(env.AI_PER_POLL || 4));
+  const reseen = new Set(snap.reseen);
 
   // 1. Tareas del campus: se clasifican (entrega, examen, actividad o informativa) antes de comparar
   const all = [];
   for (const c of assignData.courses || []) {
-    snap.courses[c.id] = clip(c.fullname, 70);
+    snap.courses[c.id] = clip(tidyCourse(c.fullname), 70);
     for (const a of c.assignments || []) { all.push({ a, c }); snap.assigns[a.id] = [clip(a.name, 120), c.id, a.duedate || 0, a.cmid]; }
   }
   const live = new Set(all.map((x) => String(x.a.id)));
@@ -517,10 +600,10 @@ export async function pollUser(env, user) {
     if (r.sure) snap.cls[a.id] = r.type; else doubt.push({ id: a.id, name: a.name, intro: htmlToText(a.intro).slice(0, 300), course: snap.courses[c.id] });
   }
   if (doubt.length) {
-    const hits = await cacheGet(env, doubt.slice(0, 40).map((d) => 'a:' + d.id));
+    const hits = await cacheGet(env, doubt.slice(0, 40).map((d) => 'a:' + d.id), snap.rereadAt);
     const ask = [];
     for (const d of doubt.slice(0, 40)) { if (hits['a:' + d.id]) snap.cls[d.id] = hits['a:' + d.id]; else ask.push(d); }
-    if (ask.length && env.AI) {
+    if (ask.length && hasAI(env)) {
       aiCalls++;
       try {
         const res = await classifyAssignments(env, ask.slice(0, 12));
@@ -549,38 +632,42 @@ export async function pollUser(env, user) {
     }
   }
 
-  // 2. Avisos: foros de novedades con debates nuevos (máx. 4 foros y 3 lecturas con IA por revisión)
+  // 2. Avisos: foros de novedades con debates nuevos (máx. 4 foros y AI_PER_POLL lecturas con IA por revisión)
   const seen = new Set(snap.seen);
   const pending = (forums || []).filter((f) => f.type === 'news' && (snap.forums[f.id] ?? -1) !== (f.numdiscussions || 0));
   for (const f of pending.slice(0, 4)) {
     if (!f.numdiscussions) { snap.forums[f.id] = 0; continue; }
     let res;
-    try { res = await moodle(env, token, 'mod_forum_get_forum_discussions', { forumid: f.id, sortorder: 3, page: 0, perpage: 6 }); } catch { continue; }
+    try { res = await moodle(env, token, 'mod_forum_get_forum_discussions', { forumid: f.id, sortorder: 3, page: 0, perpage: 15 }); } catch { continue; }
     let complete = true;
     for (const d of res.discussions || []) {
       const did = d.discussion || d.id;
       if (seen.has(did)) continue;
       const course = snap.courses[f.course] || '';
       const notice = { id: did, subject: clip(d.subject || d.name, 140), text: htmlToText(d.message), created: d.created || now, course, courseId: f.course, url: `${base}/mod/forum/discuss.php?d=${did}` };
-      const silent = notice.created < user.created_at; // anterior al alta: se lee, pero no se notifica
+      // anterior al alta o ya visto antes de «volver a leer»: se lee, pero no se notifica
+      const silent = notice.created < user.created_at || reseen.has(did);
       let found = null;
-      if (notice.created > now - 45 * 86400 && !events.some((e) => e.noticeId === did)) {
-        const hit = (await cacheGet(env, ['n:' + did]))['n:' + did];
+      if (notice.created > now - WINDOW) {
+        const hit = (await cacheGet(env, ['n:' + did], snap.rereadAt))['n:' + did];
         if (hit) found = parse(hit, { items: [], source: 'ia' });
-        else if (aiCalls >= 3 && env.AI) { complete = false; break; } // el resto, en la próxima revisión
+        else if (aiCalls >= AI_PER_POLL && hasAI(env)) { complete = false; break; } // el resto, en la próxima revisión
         else {
           found = await extractFromNotice(env, notice);
-          if (found.source !== 'filtro' && env.AI) aiCalls++;
+          if (found.source !== 'filtro' && hasAI(env)) aiCalls++;
           if (found.source === 'ia') await cachePut(env, 'n:' + did, JSON.stringify(found));
         }
-      }
+        snap.nst[did] = found.source === 'filtro' ? 'filtro' : `${found.source}:${found.items.length}`;
+      } else snap.nst[did] = 'antiguo';
       seen.add(did); snap.seen.push(did);
       if (!silent) fresh.push({ k: `notice:${did}`, t: 'notice', ts: notice.created, title: notice.subject, body: clip(notice.text, 220), course, courseId: f.course, ref: did, url: notice.url });
       (found?.items || []).forEach((it, n) => {
         if (it.start < now - 86400) return;
+        const evId = n ? `d${did}_${n}` : 'd' + did;
+        if (marks[evId]?.hide || events.some((e) => e.id === evId)) return;
         const dup = [...byKey.values()].some((x) => x.t === it.type && x.c === f.course && sameDay(x.ts, it.start)) || events.some((e) => (e.type || 'examen') === it.type && e.courseId === f.course && sameDay(e.start, it.start));
         if (dup) return;
-        const ev = { id: n ? `d${did}_${n}` : 'd' + did, type: it.type, title: it.title, course, courseId: f.course, start: it.start, end: it.end, allDay: it.allDay, place: it.place, source: found.source, noticeId: did, url: notice.url, detected: now };
+        const ev = { id: evId, by: found.by, type: it.type, title: it.title, course, courseId: f.course, start: it.start, end: it.end, allDay: it.allDay, place: it.place, source: found.source, noticeId: did, url: notice.url, detected: now };
         events.push(ev);
         if (it.start > now) byKey.set(ev.id, { k: ev.id, t: it.type, title: it.title, course, ts: it.start, c: f.course, ...(it.allDay ? { allDay: 1 } : {}) });
         fresh.push({ k: `det:${ev.id}`, t: 'detected', kind: it.type, ts: now, title: it.title, course, courseId: f.course, due: it.start, allDay: it.allDay, ref: ev.id, url: notice.url, silent });
@@ -588,6 +675,9 @@ export async function pollUser(env, user) {
     }
     if (complete) snap.forums[f.id] = f.numdiscussions || 0;
   }
+
+  const keepSeen = new Set(snap.seen.map(String));
+  for (const k of Object.keys(snap.nst)) if (!keepSeen.has(k)) delete snap.nst[k];
 
   // 3. Notificaciones del campus: calificaciones, retroalimentación y demás
   const notifs = notifData.notifications || [];
@@ -736,15 +826,33 @@ async function api(request, env, url) {
   if (!user) return fail(401, 'unauthorized', 'Sesión no válida. Vuelve a conectar la app.');
 
   if (path === '/api/feed' && method === 'GET') {
+    const now = nowSec();
     const total = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE status = 'ok'").first()).n;
     const cfg = {};
-    for (const row of (await env.DB.prepare("SELECT k, v FROM config WHERE k IN ('ai_ok', 'ai_err')").all()).results || []) cfg[row.k] = row.v;
+    for (const row of (await env.DB.prepare("SELECT k, v FROM config WHERE k IN ('ai_ok', 'ai_err', 'ai_block')").all()).results || []) cfg[row.k] = row.v;
+    let ok = parse(cfg.ai_ok, null);
+    if (typeof ok === 'number') ok = { at: ok, by: null }; // formato de la versión 1.1
+    const snap = parse(user.snapshot, {}) || {};
+    const pollers = env.SELF ? Math.max(1, +(env.POLLERS || 6)) : 1;
     return json({
-      status: user.status, events: parse(user.events, []), changes: parse(user.changes, []), cls: parse(user.snapshot, {})?.cls || {},
+      status: user.status, events: parse(user.events, []), changes: parse(user.changes, []), cls: snap.cls || {}, nst: snap.nst || {}, rereadAt: snap.rereadAt || 0,
       prefs: cleanPrefs(parse(user.prefs, {})), ustate: cleanUstate(parse(user.ustate, {})), devices: parse(user.subs, []).length,
-      lastOk: user.last_ok, cadenceMinutes: Math.max(+(env.POLL_MINUTES || 10), total), feedPath: `/cal/${user.id}-${user.feed_secret}.ics`,
-      ai: { on: !!env.AI, ok: +(cfg.ai_ok || 0), err: parse(cfg.ai_err, null) }, keySource: (await masterSecret(env)).source, version: VERSION,
+      lastOk: user.last_ok, cadenceMinutes: Math.max(+(env.POLL_MINUTES || 10), Math.ceil(total / pollers)), feedPath: `/cal/${user.id}-${user.feed_secret}.ics`,
+      ai: { on: hasAI(env), providers: aiProviders(env).map((p) => p.id), ok: ok?.at || 0, by: ok?.by || null, err: parse(cfg.ai_err, null), paused: Object.entries(parse(cfg.ai_block, {})).filter(([, u]) => u > now).map(([k]) => k) },
+      keySource: (await masterSecret(env)).source, version: VERSION,
     });
+  }
+  if (path === '/api/reread' && method === 'POST') {
+    const now = nowSec();
+    const snap = parse(user.snapshot, null);
+    if (!snap) return fail(409, 'notyet', 'Espera a que termine la primera revisión del campus.');
+    if (now - (snap.rereadAt || 0) < 3600) return fail(429, 'toosoon', 'Ya pediste volver a leer los avisos hace menos de una hora.');
+    snap.reseen = (snap.seen || []).slice(-400);
+    snap.forums = {}; snap.seen = []; snap.nst = {}; snap.cls = {}; snap.rereadAt = now;
+    const events = parse(user.events, []).filter((e) => !e.noticeId);
+    const agenda = parse(user.agenda, []).filter((i) => !/^d\d/.test(i.k));
+    await env.DB.prepare('UPDATE users SET snapshot = ?, events = ?, agenda = ?, last_poll = 0 WHERE id = ?').bind(JSON.stringify(snap), JSON.stringify(events), JSON.stringify(agenda), user.id).run();
+    return json({ ok: true });
   }
   if (path === '/api/sync' && method === 'POST') {
     const body = await readJson(request, 200000);
@@ -808,10 +916,36 @@ async function calendar(env, url) {
   return new Response(buildIcs([...parse(user.events, []), ...manual]), { headers: { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'private, max-age=900' } });
 }
 
+/* ───────────────────────── vigilante ───────────────────────── */
+
+/** Reserva de forma atómica al usuario que más tiempo lleva sin revisar (varias revisiones a la vez no se pisan). */
+async function claimNext(env) {
+  const now = nowSec(), cutoff = now - 60 * +(env.POLL_MINUTES || 10) + 20;
+  return env.DB.prepare("UPDATE users SET last_poll = ? WHERE id = (SELECT id FROM users WHERE status = 'ok' AND last_poll < ? ORDER BY last_poll ASC LIMIT 1) RETURNING *").bind(now, cutoff).first();
+}
+async function pollNext(env) {
+  const user = await claimNext(env);
+  if (!user) return { status: 'nada' };
+  try { const r = await pollUser(env, user); console.log('revisión', user.id, JSON.stringify(r)); return { id: user.id, ...r }; }
+  catch (e) {
+    console.log('revisión fallida', user.id, e.message);
+    await env.DB.prepare('UPDATE users SET fails = fails + 1 WHERE id = ?').bind(user.id).run().catch(() => {});
+    return { id: user.id, status: 'error' };
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     try {
+      // Revisión interna: la lanza el propio Worker (binding SELF) para revisar a varias personas a la vez,
+      // cada una en su propia ejecución y con su propio límite de CPU.
+      if (url.pathname === '/__poll') {
+        if (request.method !== 'POST' || !env.DB) return new Response('No encontrado', { status: 404 });
+        await ensureSchema(env);
+        if (!safeEqual(request.headers.get('x-plazo-poll') || '', await sign(env, 'poll-internal'))) return new Response('No encontrado', { status: 404 });
+        return json(await pollNext(env));
+      }
       if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/cal/')) {
         if (!env.DB) return fail(503, 'setup', 'Falta la base de datos D1 (binding DB).');
         await ensureSchema(env);
@@ -826,15 +960,23 @@ export default {
     }
   },
 
-  // Cada minuto: revisa al usuario que lleva más tiempo sin revisar.
-  // Uno por ejecución para no pasar del límite de CPU del plan gratuito.
+  // Cada minuto: revisa a las personas que más tiempo llevan sin revisar.
+  // Con el binding SELF, hasta POLLERS revisiones en paralelo (cada una con su propio límite de CPU); sin él, una.
   async scheduled(event, env, ctx) {
     if (!env.DB) return;
     await ensureSchema(env);
     const cutoff = nowSec() - 60 * +(env.POLL_MINUTES || 10) + 20;
-    const user = await env.DB.prepare("SELECT * FROM users WHERE status = 'ok' AND last_poll < ? ORDER BY last_poll ASC LIMIT 1").bind(cutoff).first();
-    if (!user) return;
-    try { console.log('revisión', user.id, JSON.stringify(await pollUser(env, user))); }
-    catch (e) { console.log('revisión fallida', user.id, e.message); await env.DB.prepare('UPDATE users SET last_poll = ?, fails = fails + 1 WHERE id = ?').bind(nowSec(), user.id).run().catch(() => {}); }
+    const due = (await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE status = 'ok' AND last_poll < ?").bind(cutoff).first()).n;
+    if (!due) return;
+    const n = Math.min(due, Math.max(1, Math.min(20, +(env.POLLERS || 6))));
+    if (env.SELF && n > 1) {
+      const key = await sign(env, 'poll-internal');
+      const res = await Promise.allSettled(Array.from({ length: n }, () => env.SELF.fetch('https://plazo.internal/__poll', { method: 'POST', headers: { 'x-plazo-poll': key } }).then((r) => r.json())));
+      const failed = res.filter((r) => r.status === 'rejected');
+      console.log('revisiones en paralelo:', n, failed.length ? `· ${failed.length} fallidas: ${failed[0].reason?.message}` : '');
+      if (failed.length === n) await pollNext(env); // el binding no funciona: al menos una revisión normal
+    } else {
+      await pollNext(env);
+    }
   },
 };
