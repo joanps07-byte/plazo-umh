@@ -17,7 +17,8 @@ def reply(fn, form):
             A(2, 'Práctica 2 <script>window.__xss=1</script>', state['due2'], '<p onclick="window.__xss=1">Texto <img src=x onerror="window.__xss=1"> <a href="javascript:window.__xss=1">malo</a> <a href="https://umh.es">bueno</a></p><script>window.__xss=1</script><iframe src="https://evil.example"></iframe>'),
             A(3, 'Sin fecha', 0), A(4, 'Tema 6', now + 2 * D, '<p>Parcial presencial</p>'), A(5, 'Publicación del profesor', now + 4 * D),
             A(6, 'Calificaciones examen parcial 1', now + 1 * D), A(7, 'Examen parcial 2', now + 6 * D), A(8, 'Práctica atrasada', now - 2 * D)]},
-            {'id': 6, 'fullname': 'Álgebra Matricial (1234_Grado Curso 2026/2027)', 'assignments': []}]}
+            {'id': 6, 'fullname': 'Álgebra Matricial (1234_Grado Curso 2026/2027)', 'assignments': []},
+            {'id': 9, 'shortname': 'ML_MAT', 'fullname': 'MODELOS LINEALES (9876_Grado en Matemáticas 2026/2027)', 'assignments': [A(20, 'Hoja de ejercicios 1', now - 6 * D)]}]}
     if fn == 'core_calendar_get_action_events_by_timesort':
         ev = lambda cm, ts: {'id': 900 + cm, 'modulename': 'assign', 'instance': cm, 'timesort': ts, 'url': f'https://campus.umh.es/mod/assign/view.php?id={cm}'}
         return {'events': [ev(12, state['due2']), ev(14, now + 2 * D), ev(15, now + 4 * D), ev(16, now + D), ev(17, now + 6 * D), ev(18, now - 2 * D)]}
@@ -41,8 +42,8 @@ async def server(route):
     if path == '/api/config': out = {'ready': True, 'vapidPublicKey': 'x', 'version': '1.1.0', 'ai': True, 'keySource': 'auto'}
     elif path == '/api/register': srv['registered'] += 1; out = {'auth': '77.firma', 'feedPath': '/cal/77-secreto.ics'}
     elif path == '/api/feed':
-        out = {'status': 'ok', 'changes': [], 'cls': {'4': 'examen', '5': 'info'}, 'devices': 0, 'lastOk': now - 120, 'cadenceMinutes': 10, 'feedPath': '/cal/77-secreto.ics', 'version': '1.1.0', 'keySource': 'auto',
-               'ai': {'on': True, 'ok': now - 600, 'err': None}, 'ustate': {'rev': 0, 'manual': [], 'marks': {}}, 'prefs': {'notice': True, 'feedback': True, 'rem': {'examen': [604800, 86400], 'entrega': [86400, 10800], 'actividad': [86400, 3600]}},
+        out = {'status': 'ok', 'changes': [], 'cls': {'4': 'examen', '5': 'info'}, 'devices': 0, 'lastOk': now - 120, 'cadenceMinutes': 10, 'feedPath': '/cal/77-secreto.ics', 'version': '1.2.0', 'nst': {'800': 'ia:2'}, 'keySource': 'auto',
+               'ai': {'on': True, 'ok': now - 600, 'err': None, 'by': 'cf:@cf/openai/gpt-oss-120b', 'providers': ['cf:@cf/openai/gpt-oss-120b'], 'paused': []}, 'ustate': {'rev': 0, 'manual': [], 'marks': {}}, 'prefs': {'notice': True, 'feedback': True, 'rem': {'examen': [604800, 86400], 'entrega': [86400, 10800], 'actividad': [86400, 3600]}},
                'events': [{'id': 'd800', 'type': 'examen', 'title': 'Parcial sorpresa', 'course': 'Modelos Lineales', 'courseId': 5, 'start': now + 12 * D, 'end': None, 'allDay': True, 'source': 'ia', 'noticeId': 800, 'url': 'https://campus.umh.es/mod/forum/discuss.php?d=800'},
                           {'id': 'd800_1', 'type': 'examen', 'title': 'Duplicado del calendario', 'course': 'Modelos Lineales', 'courseId': 5, 'start': now + 10 * D + 60, 'end': None, 'allDay': False, 'source': 'ia', 'noticeId': 800, 'url': ''}]}
     elif path == '/api/sync': srv['sync'].append(body)
@@ -79,6 +80,7 @@ async def main():
         # Marcar la atrasada como hecha
         await page.click('.check[data-key="a:8"]'); t = await txt('#list'); assert 'Práctica atrasada' not in t, t
         await page.click('[data-filter="hechas"]'); t = await txt('#list'); assert 'Práctica atrasada' in t and 'Hecha' in t and 'Práctica 1' in t and 'Entregada' in t, t
+        assert 'Hoja de ejercicios 1' in t and 'Modelos Lineales · Grado en Matemáticas' in t and 'Modelos Lineales · Grado en Estadística' in t, t
         await page.click('[data-filter="todas"]'); t = await txt('#list'); assert 'No requieren acción (2)' in t and 'Calificaciones examen parcial 1' in t and 'Sin fecha' in t, t
         # Contenido del campus saneado
         await page.click('.row-main[data-key="a:2"]'); await page.wait_for_selector('.sheet .rich')
@@ -110,7 +112,7 @@ async def main():
         await page.click('.filters [data-type="examen"]'); assert await page.locator('.cal .marks i.t-examen').count() == n_all
         # Avisos: aviso del profesor y calificación; el justificante de entrega no
         await page.click('.tab[data-view="avisos"]'); f = await txt('.screen'); assert 'Aviso de prueba' in f and 'ha sido calificada' in f and 'Usted ha realizado' not in f, f
-        await page.click('.row-main[data-act="notice"]'); s = await txt('.sheet'); assert 'Añadido a tu agenda desde este aviso' in s and 'Parcial sorpresa' in s, s
+        await page.click('.row-main[data-act="notice"]'); s = await txt('.sheet'); assert 'Añadido a tu agenda desde este aviso' in s and 'Parcial sorpresa' in s and 'Leído por la IA: encontró 2 fechas' in s, s
         await page.keyboard.press('Escape')
         assert await page.evaluate('window.__xss') is None, 'se ejecutó HTML del campus'
         # Sincronización con el servidor: agenda para recordatorios y estado del usuario
@@ -119,7 +121,7 @@ async def main():
         assert 'a:8' not in keys and 'a:6' not in keys and 'a:5' not in keys and 'm2' not in keys and 'd800_1' not in keys and 'd800' in keys and 'm4' in keys, list(keys)
         assert last['ustate']['marks']['a:8'] == {'done': 1} and last['ustate']['marks']['a:7'] == {'type': 'entrega'} and last['ustate']['manual'][0]['title'] == 'Visita al laboratorio', last['ustate']
         # Ajustes: recordatorios por tipo
-        await page.click('.me'); s = await txt('.sheet'); assert 'Recordarme antes de' in s and 'Revisa el campus cada 10 min' in s and 'Activa · última lectura' in s, s
+        await page.click('.me'); s = await txt('.sheet'); assert 'Recordarme antes de' in s and 'Revisa el campus cada 10 min' in s and 'Activa · última lectura' in s and 'Cloudflare (falta la clave de Groq)' in s and 'Volver a leer todos los avisos' in s, s
         assert await page.get_attribute('.rem.t-examen [data-off="604800"]', 'aria-pressed') == 'true'
         await page.click('.rem.t-examen [data-off="10800"]'); await page.click('.rem.t-actividad [data-off="3600"]'); await page.click('[data-pref="notice"]'); await page.wait_for_timeout(200)
         assert srv['prefs'][-1]['prefs'] == {'notice': False, 'feedback': True, 'rem': {'examen': [604800, 86400, 10800], 'entrega': [86400, 10800], 'actividad': [86400]}}, srv['prefs'][-1]

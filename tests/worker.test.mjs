@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import nodeCrypto from 'node:crypto';
-import worker, { b64u, encryptPush, parseDateEs, madridToEpoch, buildIcs, extractFromNotice, classifyAssignments, ruleType, cleanPrefs, htmlToText } from '../worker/index.js';
+import worker, { b64u, encryptPush, parseDateEs, madridToEpoch, buildIcs, extractFromNotice, classifyAssignments, ruleType, cleanPrefs, htmlToText, tidyCourse, aiProviders } from '../worker/index.js';
 
 const enc = new TextEncoder();
 let passed = 0;
 const test = async (name, fn) => { try { await fn(); passed++; console.log('  ok  ' + name); } catch (e) { console.log('FALLA ' + name + '\n', e); process.exitCode = 1; } };
 const realLog = console.log;
-const quiet = (on) => { console.log = on ? (...a) => { if (!/^(revisión|IA no|clasificación|push)/.test(String(a[0]))) realLog(...a); } : realLog; };
+const quiet = (on) => { console.log = on ? (...a) => { if (!/^(revisi|IA|clasificaci|push)/.test(String(a[0]))) realLog(...a); } : realLog; };
 quiet(true);
 
 /* ── D1 simulado con SQLite ── */
@@ -129,6 +129,17 @@ await test('Preferencias: solo se aceptan antelaciones conocidas', () => {
   assert.deepEqual(cleanPrefs({ task_new: true, exam: true }).rem.entrega, [86400, 10800], 'preferencias de la versión 1');
 });
 
+await test('Nombres de asignatura: se acortan solo para mostrar', () => {
+  assert.equal(tidyCourse('MODELOS LINEALES (2345_Grado en Estadística Curso 2026/2027)'), 'Modelos Lineales');
+  assert.equal(tidyCourse('Álgebra Matricial (1234_Grado 2026/2027)'), 'Álgebra Matricial');
+});
+
+await test('IA: orden de proveedores y modelos configurables', () => {
+  assert.deepEqual(aiProviders({ GROQ_API_KEY: 'k', AI: {} }).map((p) => p.id), ['groq:openai/gpt-oss-120b', 'groq:llama-3.3-70b-versatile', 'groq:openai/gpt-oss-20b', 'cf:@cf/openai/gpt-oss-120b', 'cf:@cf/meta/llama-3.3-70b-instruct-fp8-fast']);
+  assert.deepEqual(aiProviders({ AI: {}, AI_MODEL: '@cf/x' }).map((p) => p.id), ['cf:@cf/x'], 'variable AI_MODEL de la versión 1.1');
+  assert.deepEqual(aiProviders({}), []);
+});
+
 await test('htmlToText', () => assert.equal(htmlToText('<p>Hola&nbsp;<b>mundo</b></p><p>2 &lt; 3</p>'), 'Hola mundo\n2 < 3'));
 
 /* ── Flujo completo con un campus simulado ── */
@@ -148,6 +159,7 @@ const campus = {
 };
 const pushes = [];
 const aiLog = [];
+let groq = () => { throw new Error('Groq no esperado'); };
 const receiver = makeReceiver();
 globalThis.fetch = async (url, init) => {
   url = String(url);
@@ -165,6 +177,7 @@ globalThis.fetch = async (url, init) => {
     }
     return reply({ exception: 'x', errorcode: 'unknownfunction', message: p.get('wsfunction') });
   }
+  if (url === 'https://api.groq.com/openai/v1/chat/completions') return groq(JSON.parse(init.body), init);
   if (url.startsWith('https://web.push.apple.com/')) {
     assert.match(init.headers.authorization, /^vapid t=[\w-]+\.[\w-]+\.[\w-]+, k=[\w-]+$/);
     assert.equal(init.headers['content-encoding'], 'aes128gcm');
@@ -182,6 +195,46 @@ const AI = { run: async (model, input) => {
   const m = /EXAMEN:(\d{4}-\d{2}-\d{2})/.exec(usr), e = /ENTREGA:(\d{4}-\d{2}-\d{2})/.exec(usr);
   return { response: { items: [m && { tipo: 'examen', titulo: 'Segundo parcial', fecha: m[1], hora_inicio: '10:30', hora_fin: null, lugar: 'Aula 2.1' }, e && { tipo: 'entrega', titulo: 'Memoria del proyecto', fecha: e[1], hora_inicio: null, hora_fin: null, lugar: null }].filter(Boolean) } };
 } };
+
+await test('IA: Groq primero; si agota el cupo se pausa y responde Cloudflare', async () => {
+  const genv = { DB: mockD1(), GROQ_API_KEY: 'gsk_test', AI: { run: async () => ({ choices: [{ message: { content: 'Aquí va: {"items":[{"tipo":"examen","titulo":"Final","fecha":"2026-12-18","hora_inicio":"","hora_fin":"","lugar":""}]}' } }] }) } };
+  await worker.fetch(new Request('https://plazo.test/api/config'), genv); // crea las tablas
+  const notice = { id: 5, subject: 'Examen final', text: 'El examen final será el 18 de diciembre.', created: Date.UTC(2026, 10, 14) / 1000, course: 'X', courseId: 1 };
+  const seen = [];
+  groq = (body, init) => {
+    seen.push(body.model);
+    assert.equal(init.headers.authorization, 'Bearer gsk_test');
+    assert.equal(body.response_format.type, 'json_object');
+    if (body.model === 'openai/gpt-oss-120b') { assert.equal(body.reasoning_effort, 'medium'); assert.match(body.messages[0].content, /esquema/); }
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"items":[{"tipo":"examen","titulo":"Examen final","fecha":"2026-12-18","hora_inicio":"09:00","hora_fin":"","lugar":"Aula 1"}]}' } }] }), { status: 200 });
+  };
+  const a = await extractFromNotice(genv, notice);
+  assert.deepEqual([a.source, a.by, a.items[0].allDay, a.items[0].place], ['ia', 'groq:openai/gpt-oss-120b', false, 'Aula 1']);
+  groq = (body) => { seen.push(body.model); return new Response('{"error":{"message":"Rate limit reached: tokens per day (TPD)"}}', { status: 429, headers: { 'retry-after': '30' } }); };
+  seen.length = 0;
+  const b = await extractFromNotice(genv, notice);
+  assert.deepEqual(seen, ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b']);
+  assert.deepEqual([b.source, b.by, b.items[0].allDay], ['ia', 'cf:@cf/openai/gpt-oss-120b', true], 'Cloudflare con salida estilo chat y texto alrededor del JSON');
+  seen.length = 0;
+  await extractFromNotice(genv, notice);
+  assert.deepEqual(seen, [], 'los modelos de Groq quedan en pausa y no se insiste');
+  const blocks = JSON.parse(genv.DB._db.prepare("SELECT v FROM config WHERE k = 'ai_block'").get().v);
+  assert.ok(blocks['groq:openai/gpt-oss-120b'] > Date.now() / 1000 + 20);
+  const ok = JSON.parse(genv.DB._db.prepare("SELECT v FROM config WHERE k = 'ai_ok'").get().v);
+  assert.equal(ok.by, 'cf:@cf/openai/gpt-oss-120b');
+  groq = () => { throw new Error('Groq no esperado'); };
+});
+
+await test('IA: si todas fallan se usan reglas y queda constancia del error', async () => {
+  const fenv = { DB: mockD1(), GROQ_API_KEY: 'mala', AI: { run: async () => { throw new Error('model not found'); } } };
+  await worker.fetch(new Request('https://plazo.test/api/config'), fenv);
+  groq = () => new Response('{"error":"invalid key"}', { status: 401 });
+  const r = await extractFromNotice(fenv, { id: 6, subject: 'Parcial', text: 'El parcial será el 18 de diciembre a las 10:00.', created: Date.UTC(2026, 10, 14) / 1000, course: 'X', courseId: 1 });
+  assert.equal(r.source, 'reglas');
+  assert.equal(r.items[0].type, 'examen');
+  assert.match(JSON.parse(fenv.DB._db.prepare("SELECT v FROM config WHERE k = 'ai_err'").get().v).msg, /Cloudflare AI/);
+  groq = () => { throw new Error('Groq no esperado'); };
+});
 
 const env = { DB: mockD1(), AI, MOODLE_URL: 'https://campus.umh.es', POLL_MINUTES: '10' };
 const call = (path, { method = 'GET', body, auth } = {}) => worker.fetch(new Request('https://plazo.test' + path, { method, body: body ? JSON.stringify(body) : undefined, headers: auth ? { authorization: 'Bearer ' + auth } : {} }), env);
@@ -340,6 +393,26 @@ await test('Calendario: el enlace secreto incluye lo detectado y lo añadido a m
   assert.deepEqual((await feedOf()).events.map((e) => e.id), ['d901_1']);
 });
 
+await test('Avisos: estado de lectura por aviso y «volver a leer»', async () => {
+  let feed = await feedOf();
+  assert.equal(feed.nst['901'], 'ia:2');
+  assert.equal(feed.nst['902'], 'filtro');
+  assert.equal(feed.nst['900'], 'antiguo');
+  assert.deepEqual(feed.ai.providers, ['cf:@cf/openai/gpt-oss-120b', 'cf:@cf/meta/llama-3.3-70b-instruct-fp8-fast']);
+  assert.equal(feed.ai.by, 'cf:@cf/openai/gpt-oss-120b');
+  aiLog.length = 0; pushes.length = 0;
+  assert.equal((await call('/api/reread', { method: 'POST', auth: session })).status, 200);
+  assert.equal((await call('/api/reread', { method: 'POST', auth: session })).status, 429, 'una vez por hora');
+  feed = await feedOf();
+  assert.deepEqual(feed.events, [], 'lo detectado se borra y se vuelve a detectar');
+  env.DB._db.exec("UPDATE ai_cache SET at = at - 10"); // la caché anterior a la relectura no vale
+  await tick();
+  feed = await feedOf();
+  assert.deepEqual(feed.events.map((e) => e.id).sort(), ['d901', 'd901_1'], 'quitar no es permanente si no se marca en la app');
+  assert.ok(aiLog.includes('aviso') && aiLog.includes('clasificar'), aiLog.join());
+  assert.equal(pushes.length, 0, 'releer no vuelve a notificar lo ya visto');
+});
+
 await test('Vigilante: token caducado → aviso único para reconectar', async () => {
   campus.tokenValid = false;
   rewind(); await tick();
@@ -356,6 +429,22 @@ await test('API: eliminar la cuenta borra todos los datos', async () => {
   assert.equal((await call('/api/account', { method: 'DELETE', auth: session })).status, 200);
   assert.equal(env.DB._db.prepare('SELECT COUNT(*) AS n FROM users').get().n, 0);
   assert.equal((await call('/api/feed', { auth: session })).status, 401);
+});
+
+await test('Vigilante: varias revisiones en paralelo sin repetir usuario', async () => {
+  const penv = { DB: mockD1(), MOODLE_URL: 'https://campus.umh.es', POLL_MINUTES: '10', POLLERS: '3' };
+  penv.SELF = { fetch: (u, init) => worker.fetch(new Request(u, init), penv) };
+  assert.equal((await worker.fetch(new Request('https://plazo.test/api/register', { method: 'POST', body: JSON.stringify({ token: TOKEN }) }), penv)).status, 200);
+  for (const id of [5001, 5002, 5003]) penv.DB._db.prepare("INSERT INTO users (id, name, token_enc, salt, feed_secret, created_at) SELECT ?, name, token_enc, salt, feed_secret, created_at FROM users WHERE id = 4242").run(id);
+  assert.equal((await worker.fetch(new Request('https://plazo.test/__poll', { method: 'POST' }), penv)).status, 404, 'la revisión interna exige la clave');
+  await worker.scheduled({}, penv, {});
+  let rows = penv.DB._db.prepare('SELECT id, last_ok FROM users ORDER BY id').all();
+  assert.equal(rows.filter((r) => r.last_ok > 0).length, 3, 'tres revisiones distintas en una pasada');
+  await worker.scheduled({}, penv, {});
+  rows = penv.DB._db.prepare('SELECT id, last_ok FROM users ORDER BY id').all();
+  assert.ok(rows.every((r) => r.last_ok > 0), 'en la siguiente pasada, el que faltaba');
+  await worker.scheduled({}, penv, {});
+  assert.ok(penv.DB._db.prepare('SELECT COUNT(*) AS n FROM users WHERE last_poll > 0').get().n === 4);
 });
 
 quiet(false);
