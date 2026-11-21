@@ -1,9 +1,9 @@
-// Plazo 1.1 — app (sin dependencias, sin compilación).
+// Plazo 1.2 — app (sin dependencias, sin compilación).
 // Lee el Campus Virtual UMH con la API móvil oficial de Moodle, directamente desde el dispositivo.
 // El servidor de Plazo aporta la IA (clasifica tareas y lee avisos), los recordatorios y las notificaciones.
 import { demoData } from './demo.js';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const MOODLE = 'https://campus.umh.es';
 const FORCED_DEMO = document.documentElement.hasAttribute('data-demo'); // vista previa sin servidor
 const DEMO = FORCED_DEMO || new URLSearchParams(location.search).has('demo');
@@ -162,6 +162,10 @@ function tidyCourse(full) {
   }
   return s;
 }
+function courseExtra(full) {
+  const m = /\(([^()]*)\)\s*$/.exec(String(full || ''));
+  return m ? m[1].replace(/^\s*\d+_/, '').replace(/\s*(curso\s*)?\d{4}\s*\/\s*\d{4}\s*$/i, '').trim() : '';
+}
 function parseToken(input) {
   let s = String(input || '').trim();
   try { s = decodeURIComponent(s); } catch { /* se usa tal cual */ }
@@ -191,9 +195,13 @@ async function loadAll() {
   ]);
   if (calTok?.token) { S.account.calToken = calTok.token; save('account'); }
 
+  // Cada asignatura se identifica por su número del campus. Si dos tienen el mismo nombre corto
+  // (por ejemplo, la misma asignatura en dos carreras), se añade la titulación para distinguirlas.
   const courses = {};
   const ids = (assign.courses || []).map((c) => c.id).sort((a, b) => a - b);
-  for (const c of assign.courses || []) courses[c.id] = { name: tidyCourse(c.fullname) };
+  const short = {}, used = {};
+  for (const c of assign.courses || []) { short[c.id] = tidyCourse(c.fullname); used[short[c.id]] = (used[short[c.id]] || 0) + 1; }
+  for (const c of assign.courses || []) courses[c.id] = { name: used[short[c.id]] > 1 ? `${short[c.id]} · ${courseExtra(c.fullname) || c.shortname || c.id}` : short[c.id] };
 
   const pendingCm = new Set();
   for (const e of timeline.events || []) {
@@ -287,7 +295,7 @@ async function refresh(manual) {
 let memo = null;
 const dirty = () => { memo = null; };
 const course = (id) => S.data?.courses?.[id] || { name: '' };
-const courseName = (it) => it.courseName || course(it.course).name || '';
+const courseName = (it) => course(it.course).name || it.courseName || '';
 
 /** Une tareas del campus, calendario del campus, lo detectado en avisos y lo añadido a mano. */
 function items() {
@@ -653,11 +661,29 @@ function sheetNotice(id) {
   if (!n) return toast('Ese aviso ya no está disponible');
   const found = visible().filter((i) => i.src === 'aviso' && i.noticeId === n.id);
   openSheet(`${sheetTop(n.subject, [course(n.course).name, n.author, fullDate(n.created)].filter(Boolean).join(' · '))}
+    ${readStatus(n.id) ? `<p class="ai-state">${I.spark}<span>${readStatus(n.id)}</span></p>` : ''}
     ${found.length ? `<div class="section-title"><span>Añadido a tu agenda desde este aviso</span></div>${group(found.map((i) => row(i, true)))}<p class="note">Comprueba las fechas en el texto. Abre cada elemento para corregirlo o quitarlo.</p>` : ''}
     <div class="rich">${sanitize(n.html)}</div>
     <div class="actions"><button class="btn ghost" data-act="add" data-course="${n.course}">Añadir algo de este aviso a mano</button>
       <a class="btn ghost" href="${MOODLE}/mod/forum/discuss.php?d=${n.id}" target="_blank" rel="noopener">Abrir en el campus</a></div>`);
 }
+/** Qué ha hecho la IA con un aviso, en palabras. */
+function readStatus(id) {
+  if (DEMO && !S.server.nst) return '';
+  if (!S.account?.auth && !DEMO) return '';
+  const st = S.server.nst?.[id];
+  if (!st) return 'La IA aún no ha leído este aviso. Lo hará en las próximas revisiones.';
+  if (st === 'filtro') return 'No menciona fechas ni evaluaciones: no hacía falta la IA.';
+  if (st === 'antiguo') return 'Publicado hace más de 5 meses: no se analiza.';
+  const [src, n] = st.split(':');
+  if (src === 'reglas') return 'La IA no estaba disponible y se leyó con reglas. Puedes pedir que se vuelva a leer en Ajustes.';
+  return +n ? `Leído por la IA: encontró ${n} ${+n === 1 ? 'fecha' : 'fechas'} para tu agenda.` : 'Leído por la IA: no anuncia nada con fecha que tengas que hacer.';
+}
+const aiName = (id) => {
+  if (!id) return '';
+  const [k, ...rest] = id.split(':');
+  return `${k === 'groq' ? 'Groq' : 'Cloudflare'} · ${rest.join(':').replace(/^@cf\/[^/]+\//, '').replace(/^openai\//, '')}`;
+};
 function sheetEdit(key, preset = {}) {
   const it = key ? byKey(key) : null, m = it?.manual;
   const type = m?.type || preset.type || (TYPES.includes(S.agendaType) && S.view === 'agenda' ? S.agendaType : 'entrega');
@@ -697,7 +723,10 @@ function sheetSettings() {
   const prefs = prefsNow(), srv = S.server, linked = !!S.account.auth;
   const calUrl = S.account.calToken ? `webcal://campus.umh.es/calendar/export_execute.php?userid=${S.account.userid}&authtoken=${S.account.calToken}&preset_what=all&preset_time=recentupcoming` : '';
   const feedUrl = S.account.feedPath ? `webcal://${location.host}${S.account.feedPath}` : '';
-  const aiText = !linked ? '' : !srv.ai?.on ? 'Sin IA: se usan reglas' : srv.ai.err && srv.ai.err.at > (srv.ai.ok || 0) ? `Con fallos: ${srv.ai.err.msg}` : srv.ai.ok ? `Activa · última lectura hace ${ago(srv.ai.ok)}` : 'Activa · aún sin lecturas';
+  const aiText = !linked ? '' : !srv.ai?.on ? 'Sin IA: se usan reglas' : srv.ai.err && srv.ai.err.at > (srv.ai.ok || 0) ? `Con fallos: ${srv.ai.err.msg}` : srv.ai.ok ? `Activa · última lectura hace ${ago(srv.ai.ok)}${srv.ai.by ? ` (${aiName(srv.ai.by)})` : ''}` : 'Activa · aún sin lecturas';
+  const prov = srv.ai?.providers || [];
+  const engines = !linked ? '' : !prov.length ? 'Ninguno' : [prov.some((p) => p.startsWith('groq:')) ? 'Groq' : '', prov.some((p) => p.startsWith('cf:')) ? 'Cloudflare' : ''].filter(Boolean).join(' + ') + (prov.some((p) => p.startsWith('groq:')) ? '' : ' (falta la clave de Groq)');
+  const pending = Object.keys(srv.nst || {}).length;
   const reminders = TYPES.map((t) => `<div class="rem ${T[t].cls}"><div class="rem-h"><i class="mk ${T[t].cls}"></i>${T[t].many}</div>
     <div class="offs" role="group" aria-label="Recordar ${T[t].many}">${OFFSETS.map(([v, l]) => `<button data-act="rem" data-type="${t}" data-off="${v}" aria-pressed="${prefs.rem[t].includes(v)}">${l}</button>`).join('')}</div></div>`).join('');
   openSheet(`${sheetTop('Ajustes', S.account.name || '')}
@@ -720,10 +749,13 @@ function sheetSettings() {
       ${linked ? `<div class="link-row"><span>Estado</span><span>${srv.status === 'relogin' ? 'Esperando que vuelvas a conectar' : `Revisa el campus cada ${srv.cadenceMinutes || 10} min`}</span></div>
       <div class="link-row"><span>Última revisión</span><span>${srv.lastOk ? 'hace ' + ago(srv.lastOk) : 'pendiente, en unos minutos'}</span></div>
       <div class="link-row"><span>Lectura con IA</span><span>${esc(aiText)}</span></div>
+      <div class="link-row"><span>Motores de IA</span><span>${esc(engines)}${srv.ai?.paused?.length ? ` · ${srv.ai.paused.length} en pausa por cupo` : ''}</span></div>
+      <div class="link-row"><span>Avisos analizados</span><span>${pending}</span></div>
+      <button class="link-row" data-act="reread"><span>Volver a leer todos los avisos</span><span>›</span></button>
       <button class="link-row red" data-act="local-only"><span>Usar solo este dispositivo</span><span>›</span></button>`
     : `<div class="empty">${S.settings.localOnly ? 'Desactivado: sin IA, recordatorios ni notificaciones.' : esc(S.serverIssue || 'Conectando…')}</div><button class="link-row" data-act="link-server"><span>Conectar con el servidor</span><span>›</span></button>`}
     </div>
-    <p class="note">El servidor guarda tu acceso al campus cifrado y consulta por ti tareas, avisos y notificaciones. Lee con IA los avisos y los nombres de las tareas para clasificarlos. «Usar solo este dispositivo» borra tus datos del servidor.</p>
+    <p class="note">El servidor guarda tu acceso al campus cifrado y consulta por ti tareas, avisos y notificaciones. Lee con IA los avisos de los últimos 5 meses y los nombres de las tareas para clasificarlos. «Usar solo este dispositivo» borra tus datos del servidor.</p>
     <div class="section-title"><span>Calendario del iPhone</span></div>
     <div class="group">
       ${calUrl ? `<a class="link-row" href="${esc(calUrl)}"><span>Suscribirme al calendario del campus</span><span>›</span></a>` : ''}
@@ -881,10 +913,15 @@ const actions = {
   rem: (d) => { const p = prefsNow(), v = +d.off, cur = p.rem[d.type]; p.rem = { ...p.rem, [d.type]: cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v].sort((a, b) => b - a) }; savePrefs(p); },
   'test-push': async () => { if (DEMO) return toast('La demostración no envía notificaciones'); try { await api('/api/test-push', { method: 'POST' }); toast('Enviada. Debería llegar en unos segundos'); } catch (e) { toast(e.message); } },
   'dismiss-event': async (d) => {
+    setMark(d.id, { hide: 1 }); // para que no vuelva a aparecer aunque se relean los avisos
     S.server.events = (S.server.events || []).filter((e) => e.id !== d.id); save('server'); dirty(); closeSheet(); render(); toast('Quitado de tu agenda');
     if (!DEMO) await api('/api/events/dismiss', { method: 'POST', body: { id: d.id } }).catch(() => {});
   },
   'local-only': localOnly,
+  reread: async () => {
+    try { await api('/api/reread', { method: 'POST' }); toast('Se volverán a leer en las próximas revisiones'); S.server.nst = {}; save('server'); }
+    catch (e) { toast(e.message); }
+  },
   'link-server': async () => { S.settings.localOnly = false; save('settings'); toast('Conectando…'); const ok = await ensureServer(true); if (ok) await refresh(); sheetSettings(); toast(ok ? 'Servidor conectado' : S.serverIssue || 'No se pudo conectar'); },
   disconnect,
   reconnect: () => { S.view = 'conectar'; render(); window.scrollTo(0, 0); },

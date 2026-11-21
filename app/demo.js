@@ -49,8 +49,9 @@ export function demoData() {
       notifs: [{ id: 1, component: 'mod_assign', type: 'feedbackavailable', subject: 'Tu entrega «Entregable práctica 3» ha sido calificada', text: '', url: '', ts: now - 7 * 3600, course: 5 }],
     },
     server: {
-      status: 'ok', cadenceMinutes: 10, lastOk: now - 240, version: '1.1.0', keySource: 'secreto',
-      ai: { on: true, ok: now - 3 * 3600, err: null },
+      status: 'ok', cadenceMinutes: 10, lastOk: now - 240, version: '1.2.0', keySource: 'secreto',
+      ai: { on: true, ok: now - 3 * 3600, by: 'groq:openai/gpt-oss-120b', err: null, providers: ['groq:openai/gpt-oss-120b', 'groq:llama-3.3-70b-versatile', 'cf:@cf/openai/gpt-oss-120b'], paused: [] },
+      nst: { 901: 'ia:2', 902: 'ia:0', 903: 'filtro', 904: 'filtro' },
       prefs: { notice: true, feedback: true, rem: { examen: [604800, 86400], entrega: [86400, 10800], actividad: [86400, 3600] } },
       cls: { 14: 'examen', 15: 'info' },
       events: [

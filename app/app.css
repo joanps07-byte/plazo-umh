@@ -278,5 +278,8 @@ h1, h2, h3, p { margin: 0; }
 .always { flex: none; font-size: 13px; font-weight: 700; color: var(--palm); }
 div.link-row span:last-child { text-align: right; flex: 0 1 62%; overflow-wrap: anywhere; }
 
+.ai-state { display: flex; gap: 9px; align-items: flex-start; background: var(--act-soft); color: var(--ink); border-radius: 12px; padding: 10px 12px; font-size: 14px; line-height: 1.4; margin: 0 0 12px; }
+.ai-state svg { flex: none; width: 18px; height: 18px; margin-top: 1px; fill: none; stroke: var(--act); stroke-width: 1.9; stroke-linejoin: round; }
+
 @media (min-width: 700px) { .top h1 { font-size: 36px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

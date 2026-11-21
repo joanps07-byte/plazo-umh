@@ -1,5 +1,5 @@
 // Plazo — service worker: app disponible sin conexión y notificaciones push.
-const CACHE = 'plazo-v2';
+const CACHE = 'plazo-v3';
 const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'demo.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())); });
